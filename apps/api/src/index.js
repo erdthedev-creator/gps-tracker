@@ -96,7 +96,6 @@ export default {
       return new Response(INDEX_HTML, {
         headers: {
           "Content-Type": "text/html; charset=utf-8",
-          // HTML için de CORS zarar vermez; ama şart değil. İstersen kaldırabilirsin.
           ...corsHeaders(),
         },
       });
@@ -107,7 +106,43 @@ export default {
       return json({ ok: true, server_time_ms: Date.now() }, 200);
     }
 
-    // POST /ingest
+    // ------------------------------------------------------------
+    // Traccar Client (OSMAND) adapter
+    // Traccar ayarı:
+    //   Server URL: https://gps-tracker.erdthedev.workers.dev/traccar
+    //   Protocol: OSMAND
+    //
+    // Beklenen örnek:
+    //   GET /traccar?id=boat_01&lat=41.0786&lon=29.0034&timestamp=1738339200
+    // ------------------------------------------------------------
+    if (url.pathname === "/traccar" && request.method === "GET") {
+      const device_id = String(url.searchParams.get("id") || "unknown");
+      const lat = Number(url.searchParams.get("lat"));
+      const lon = Number(url.searchParams.get("lon"));
+      const ts_sec = Number(url.searchParams.get("timestamp"));
+
+      if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        return new Response("ERR", { status: 400, headers: corsHeaders() });
+      }
+
+      const entry = {
+        device_id,
+        t_ms: Number.isFinite(ts_sec) ? ts_sec * 1000 : Date.now(),
+        lat,
+        lon,
+        received_at_ms: Date.now(),
+      };
+
+      await saveLatestAndRegisterDevice(env, entry);
+
+      // Traccar beklenen success cevabı
+      return new Response("OK", {
+        status: 200,
+        headers: { "Content-Type": "text/plain; charset=utf-8", ...corsHeaders() },
+      });
+    }
+
+    // POST /ingest (JSON)
     if (url.pathname === "/ingest" && request.method === "POST") {
       let data;
       try {
@@ -133,15 +168,7 @@ export default {
         received_at_ms: Date.now(),
       };
 
-      await env.GPS_KV.put(`latest:${device_id}`, JSON.stringify(entry));
-
-      // devices list
-      const devicesRaw = await env.GPS_KV.get("devices");
-      const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
-      if (!devices.includes(device_id)) {
-        devices.push(device_id);
-        await env.GPS_KV.put("devices", JSON.stringify(devices));
-      }
+      await saveLatestAndRegisterDevice(env, entry);
 
       return json({ ok: true }, 200);
     }
@@ -202,5 +229,17 @@ function safeJsonParseArray(raw) {
     return Array.isArray(v) ? v : [];
   } catch {
     return [];
+  }
+}
+
+async function saveLatestAndRegisterDevice(env, entry) {
+  await env.GPS_KV.put(`latest:${entry.device_id}`, JSON.stringify(entry));
+
+  const devicesRaw = await env.GPS_KV.get("devices");
+  const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
+
+  if (!devices.includes(entry.device_id)) {
+    devices.push(entry.device_id);
+    await env.GPS_KV.put("devices", JSON.stringify(devices));
   }
 }
