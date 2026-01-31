@@ -1,8 +1,8 @@
 {
-  "name": "gps-tracker-api",
+  "name": "gps-tracker",
   "main": "src/index.js",
   "compatibility_date": "2025-09-15",
   "kv_namespaces": [
-    { "binding": "GPS_KV", "id": "KV_NAMESPACE_ID_BURAYA" }
+    { "binding": "GPS_KV", "id": "7728d7445aa644529b21722bbcc4a3b1" }
   ]
 }
