@@ -107,27 +107,76 @@ export default {
     }
 
     // ------------------------------------------------------------
-    // Traccar Client (OSMAND) adapter
-    // Traccar ayarı:
-    //   Server URL: https://gps-tracker.erdthedev.workers.dev/traccar
-    //   Protocol: OSMAND
+    // /traccar adapter (GET + POST)
     //
-    // Beklenen örnek:
-    //   GET /traccar?id=boat_01&lat=41.0786&lon=29.0034&timestamp=1738339200
+    // 1) GET style (OSMAND etc):
+    //    GET /traccar?id=boat_01&lat=41.0786&lon=29.0034&timestamp=1738339200
+    //
+    // 2) POST style (your iOS config):
+    //    POST /traccar?device_id=22410136
+    //    Body: {
+    //      "timestamp":"2026-01-31T...",
+    //      "coords":{"latitude":..,"longitude":..,"accuracy":..},
+    //      ...
+    //    }
+    //    (Sometimes wrapped: { "location": { ... } })
     // ------------------------------------------------------------
-    if (url.pathname === "/traccar" && request.method === "GET") {
-      const device_id = String(url.searchParams.get("id") || "unknown");
-      const lat = Number(url.searchParams.get("lat"));
-      const lon = Number(url.searchParams.get("lon"));
-      const ts_sec = Number(url.searchParams.get("timestamp"));
+    if (url.pathname === "/traccar" && (request.method === "GET" || request.method === "POST")) {
+      let device_id = "unknown";
+      let lat;
+      let lon;
+      let t_ms = Date.now();
+
+      // Prefer query params (your app sends device_id via http.params)
+      device_id = String(
+        url.searchParams.get("device_id") ||
+        url.searchParams.get("id") ||
+        "unknown"
+      );
+
+      if (request.method === "GET") {
+        lat = Number(url.searchParams.get("lat"));
+        lon = Number(url.searchParams.get("lon"));
+
+        const ts_sec = Number(url.searchParams.get("timestamp"));
+        if (Number.isFinite(ts_sec)) t_ms = ts_sec * 1000;
+      } else {
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return new Response("ERR: invalid JSON", { status: 400, headers: corsHeaders() });
+        }
+
+        // Some clients use { location: {...} }
+        const loc = body.location ?? body;
+
+        // Your payload uses coords.latitude / coords.longitude
+        lat = Number(loc?.coords?.latitude ?? loc?.latitude);
+        lon = Number(loc?.coords?.longitude ?? loc?.longitude);
+
+        // Allow overriding device_id from body if you ever set it there
+        device_id = String(loc?.device_id ?? body?.device_id ?? device_id);
+
+        // timestamp: ISO string or number
+        const ts = loc?.timestamp;
+
+        if (typeof ts === "number" && Number.isFinite(ts)) {
+          // if ms use directly; if seconds convert
+          t_ms = ts > 1e12 ? ts : ts * 1000;
+        } else if (typeof ts === "string") {
+          const parsed = Date.parse(ts);
+          if (!Number.isNaN(parsed)) t_ms = parsed;
+        }
+      }
 
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
-        return new Response("ERR", { status: 400, headers: corsHeaders() });
+        return new Response("ERR: lat/lon required", { status: 400, headers: corsHeaders() });
       }
 
       const entry = {
         device_id,
-        t_ms: Number.isFinite(ts_sec) ? ts_sec * 1000 : Date.now(),
+        t_ms,
         lat,
         lon,
         received_at_ms: Date.now(),
@@ -135,7 +184,6 @@ export default {
 
       await saveLatestAndRegisterDevice(env, entry);
 
-      // Traccar beklenen success cevabı
       return new Response("OK", {
         status: 200,
         headers: { "Content-Type": "text/plain; charset=utf-8", ...corsHeaders() },
