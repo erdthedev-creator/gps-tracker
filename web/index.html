@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Çoklu Cihaz Harita</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body { height:100%; margin:0; } #map{ height:100%; }
+    .hud{ position:fixed; top:10px; left:10px; z-index:9999; background:#fff; padding:10px; border-radius:10px; }
+  </style>
+</head>
+<body>
+  <div class="hud">
+    <div><b>Durum:</b> <span id="s">başlıyor…</span></div>
+    <div id="n"></div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const API_BASE = "WORKER_URL_BURAYA"; // sonra dolduracağız
+
+    const s = document.getElementById("s");
+    const n = document.getElementById("n");
+
+    const map = L.map("map").setView([0,0], 2);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(map);
+
+    const markers = new Map();
+
+    function ensureMarker(id, lat, lon){
+      const ll = [lat, lon];
+      if (!markers.has(id)) {
+        markers.set(id, L.marker(ll).addTo(map).bindPopup(id));
+        map.setView(ll, 15);
+      } else {
+        markers.get(id).setLatLng(ll);
+      }
+    }
+
+    async function tick(){
+      try{
+        s.textContent = "çekiliyor…";
+        const r = await fetch(`${API_BASE}/latest_all`, { cache: "no-store" });
+        const d = await r.json();
+        const items = d.items || [];
+        n.textContent = `devices: ${items.length}`;
+
+        for (const it of items) {
+          if (it.lat == null || it.lon == null) continue;
+          ensureMarker(it.device_id, it.lat, it.lon);
+        }
+        s.textContent = "ok";
+      } catch(e){
+        s.textContent = "hata";
+        n.textContent = String(e);
+      }
+    }
+    tick();
+    setInterval(tick, 1000);
+  </script>
+</body>
+</html>
