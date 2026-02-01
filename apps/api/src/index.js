@@ -1,5 +1,15 @@
 // apps/api/src/index.js
 
+// ------------------------------------------------------------
+// MAINTENANCE MODE
+// true  => servis durur (503)
+// false => servis çalışır
+// ------------------------------------------------------------
+const MAINTENANCE_MODE = true;
+
+// ------------------------------------------------------------
+// MAP UI (served at GET /)
+// ------------------------------------------------------------
 const INDEX_HTML = `<!doctype html>
 <html lang="tr">
 <head>
@@ -19,7 +29,10 @@ const INDEX_HTML = `<!doctype html>
       box-shadow: 0 2px 10px rgba(0,0,0,0.15);
       width: 360px;
     }
-    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .mono {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+                   "Liberation Mono", "Courier New", monospace;
+    }
   </style>
 </head>
 <body>
@@ -84,6 +97,21 @@ const INDEX_HTML = `<!doctype html>
 
 export default {
   async fetch(request, env) {
+    // ------------------------------------------------------------
+    // Maintenance mode: bütün endpointleri durdurur
+    // NOT: Eğer OPTIONS preflight çalışsın istiyorsan,
+    //      bu bloğu OPTIONS kontrolünün altına taşı.
+    // ------------------------------------------------------------
+    if (MAINTENANCE_MODE) {
+      return new Response("Service paused (maintenance mode)", {
+        status: 503,
+        headers: {
+          "Content-Type": "text/plain; charset=utf-8",
+          ...corsHeaders(),
+        },
+      });
+    }
+
     const url = new URL(request.url);
 
     // CORS preflight
