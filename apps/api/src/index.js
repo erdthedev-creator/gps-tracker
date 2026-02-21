@@ -5,7 +5,7 @@
 // true  => servis durur (503)
 // false => servis çalışır
 // ------------------------------------------------------------
-const MAINTENANCE_MODE = true;
+const MAINTENANCE_MODE = false;
 
 // ------------------------------------------------------------
 // MAP UI (served at GET /)
