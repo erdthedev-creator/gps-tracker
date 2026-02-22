@@ -1,12 +1,13 @@
 /**
- * gps-tracker Worker
- * - Ingest GPS (HTTP)
- * - Store latest per device in KV
- * - Course editor (rect zones + checkpoints + ordered phases)
- * - Phase-based progress (strict order, no skipping; phaseStarted required to advance)
- * - Scoreboard
- * - Hide/Unhide devices (removes from map + scoreboard)
- * - Multiple layouts (save/load by name) + active layout selection
+ * gps-tracker Worker (single-file)
+ * Features:
+ * - POST /ingest accepts format:
+ *   {lat, lon, alt?, acc?, spd?, time?, id?}  OR  {device_id, lat, lon, t_ms?}
+ * - /traccar adapter (GET/POST) for Traccar/OsmAnd style senders
+ * - KV storage: latest:<id>, race_state:<id>, devices list, hidden list
+ * - Course editor UI at "/": rectangles (zones), checkpoints (2-char badge), phases (ordered)
+ * - Multi-layout save/load by name: /course?name= , list: /courses
+ * - Active layout used by ingest/scoreboard: /active_course
  */
 
 const MAINTENANCE_MODE = false;
@@ -17,13 +18,13 @@ const KV_LATEST_PREFIX = "latest:";
 const KV_STATE_PREFIX = "race_state:";
 const KV_HIDDEN_DEVICES_KEY = "hidden:devices";
 
-// Backward compatible "active course content"
+// Backward compatible "default course content"
 const KV_COURSE_KEY = "course:active";
 
 // Multi-layout support
 const KV_COURSE_INDEX_KEY = "courses:index"; // ["default","layout1",...]
-const KV_COURSE_PREFIX = "course:";          // course:<name> (named layouts)
-const KV_ACTIVE_COURSE_NAME_KEY = "course:active_name"; // "default" | "layout1" ...
+const KV_COURSE_PREFIX = "course:";          // course:<name>
+const KV_ACTIVE_COURSE_NAME_KEY = "course:active_name"; // active layout name
 
 // ---------------------- Helpers ----------------------
 function corsHeaders() {
@@ -61,6 +62,11 @@ function nowMs() {
   return Date.now();
 }
 
+function asNumberOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 // Haversine distance in meters
 function haversineMeters(lat1, lon1, lat2, lon2) {
   const R = 6371000;
@@ -89,7 +95,7 @@ function defaultCourseTemplate(name = "default") {
     name,
     zones: [],        // [{id,name,bounds:{south,west,north,east}}]
     checkpoints: [],  // [{id,name,lat,lon}]
-    phases: [],       // ordered list: [{id,name,enter_zone_id,distance_checkpoint_id}]
+    phases: [],       // [{id,name,enter_zone_id,distance_checkpoint_id}] ordered
     activeWithinSec: 60,
   };
 }
@@ -97,7 +103,6 @@ function defaultCourseTemplate(name = "default") {
 function normalizeCourseName(name) {
   const n = String(name || "").trim();
   if (!n) return "default";
-  // allow: a-zA-Z0-9_- (spaces -> _), max 48 chars
   return n.replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "default";
 }
 
@@ -123,14 +128,14 @@ async function upsertCourseIndex(env, courseName) {
   return name;
 }
 
-// Backward compatible "active course content" getter
-async function getCourse(env) {
+// Backward-compatible default course storage
+async function getCourseDefault(env) {
   const raw = await env.GPS_KV.get(KV_COURSE_KEY);
   if (!raw) return defaultCourseTemplate("default");
   try {
     const v = JSON.parse(raw);
     v.version = 1;
-    v.name = v.name || "default";
+    v.name = "default";
     v.zones = Array.isArray(v.zones) ? v.zones : [];
     v.checkpoints = Array.isArray(v.checkpoints) ? v.checkpoints : [];
     v.phases = Array.isArray(v.phases) ? v.phases : [];
@@ -141,18 +146,16 @@ async function getCourse(env) {
   }
 }
 
-async function saveCourse(env, courseObj) {
+async function saveCourseDefault(env, courseObj) {
+  courseObj.version = 1;
+  courseObj.name = "default";
   await env.GPS_KV.put(KV_COURSE_KEY, JSON.stringify(courseObj));
 }
 
-// Named layout getter
 async function getCourseByName(env, courseName) {
   const name = normalizeCourseName(courseName);
-  if (name === "default") {
-    const c = await getCourse(env);
-    c.name = "default";
-    return c;
-  }
+  if (name === "default") return await getCourseDefault(env);
+
   const raw = await env.GPS_KV.get(KV_COURSE_PREFIX + name);
   if (!raw) return defaultCourseTemplate(name);
   try {
@@ -169,14 +172,13 @@ async function getCourseByName(env, courseName) {
   }
 }
 
-// Named layout save
 async function saveCourseByName(env, courseName, courseObj) {
   const name = normalizeCourseName(courseName);
-  courseObj.name = name;
   courseObj.version = 1;
+  courseObj.name = name;
 
   if (name === "default") {
-    await saveCourse(env, courseObj);
+    await saveCourseDefault(env, courseObj);
   } else {
     await env.GPS_KV.put(KV_COURSE_PREFIX + name, JSON.stringify(courseObj));
   }
@@ -184,7 +186,6 @@ async function saveCourseByName(env, courseName, courseObj) {
   return name;
 }
 
-// Active layout selection
 async function getActiveCourseName(env) {
   const raw = await env.GPS_KV.get(KV_ACTIVE_COURSE_NAME_KEY);
   return normalizeCourseName(raw || "default");
@@ -198,8 +199,8 @@ async function setActiveCourseName(env, name) {
 }
 
 async function getActiveCourse(env) {
-  const name = await getActiveCourseName(env);
-  return await getCourseByName(env, name);
+  const n = await getActiveCourseName(env);
+  return await getCourseByName(env, n);
 }
 
 // ---------------------- Hidden Devices ----------------------
@@ -215,7 +216,6 @@ async function setHiddenDevices(env, arr) {
 // ---------------------- Device data ----------------------
 async function saveLatestAndRegisterDevice(env, entry) {
   const deviceId = entry.device_id;
-
   await env.GPS_KV.put(KV_LATEST_PREFIX + deviceId, JSON.stringify(entry));
 
   const devicesRaw = await env.GPS_KV.get(KV_DEVICES_KEY);
@@ -229,9 +229,7 @@ async function saveLatestAndRegisterDevice(env, entry) {
 // detect zone by course rectangles (first match)
 function detectZoneId(course, lat, lon) {
   for (const z of course.zones || []) {
-    if (z && z.bounds && pointInRect(lat, lon, z.bounds)) {
-      return z.id || null;
-    }
+    if (z && z.bounds && pointInRect(lat, lon, z.bounds)) return z.id || null;
   }
   return null;
 }
@@ -241,7 +239,8 @@ function detectZoneId(course, lat, lon) {
  * Strict rules:
  * - Phase k starts ONLY when entering phases[k].enter_zone_id
  * - Advance ONLY to phase k+1 by entering phases[k+1].enter_zone_id
- * - And ONLY if current phase has started (phaseStarted=true). (No skipping, no "free advance")
+ * - AND ONLY if current phase is started (phaseStarted=true)
+ * - No skipping.
  */
 async function updateRaceState(env, course, deviceId, lat, lon, receivedAtMs) {
   const key = KV_STATE_PREFIX + deviceId;
@@ -271,20 +270,15 @@ async function updateRaceState(env, course, deviceId, lat, lon, receivedAtMs) {
     const cur = phases[state.phaseIndex] || null;
     const next = phases[state.phaseIndex + 1] || null;
 
-    // Start current phase by entering its enter zone
+    // start current phase only by entering its zone
     if (cur && cur.enter_zone_id && zoneIdNow === cur.enter_zone_id) {
       state.phaseStarted = true;
     }
 
-    // Advance ONLY to the next phase, and ONLY if current phase is started
-    if (
-      next &&
-      next.enter_zone_id &&
-      zoneIdNow === next.enter_zone_id &&
-      state.phaseStarted === true
-    ) {
+    // advance only to NEXT phase, only if current phase is started
+    if (next && next.enter_zone_id && zoneIdNow === next.enter_zone_id && state.phaseStarted === true) {
       state.phaseIndex += 1;
-      state.phaseStarted = true; // because we entered next phase's start zone
+      state.phaseStarted = true;
     }
   }
 
@@ -301,17 +295,10 @@ function computeProgress(course, state, latest, serverTimeMs) {
 
   const phaseIndex = typeof state?.phaseIndex === "number" ? state.phaseIndex : 0;
   const phaseStarted = !!state?.phaseStarted;
-
   const ph = phases[phaseIndex] || null;
 
   let distM = null;
-  if (
-    ph &&
-    ph.distance_checkpoint_id &&
-    latest &&
-    typeof latest.lat === "number" &&
-    typeof latest.lon === "number"
-  ) {
+  if (ph && ph.distance_checkpoint_id && latest && typeof latest.lat === "number" && typeof latest.lon === "number") {
     const cp = checkpoints.find((c) => c.id === ph.distance_checkpoint_id);
     if (cp && typeof cp.lat === "number" && typeof cp.lon === "number") {
       distM = haversineMeters(latest.lat, latest.lon, cp.lat, cp.lon);
@@ -328,7 +315,6 @@ function computeProgress(course, state, latest, serverTimeMs) {
 function compareRank(a, b) {
   if (a.progress.phaseIndex !== b.progress.phaseIndex) return b.progress.phaseIndex - a.progress.phaseIndex;
 
-  // same phase: started first
   if (a.progress.phaseStarted !== b.progress.phaseStarted) {
     return (b.progress.phaseStarted ? 1 : 0) - (a.progress.phaseStarted ? 1 : 0);
   }
@@ -345,7 +331,49 @@ function compareRank(a, b) {
   return bl - al;
 }
 
-// ---------------------- UI (Editor + Scoreboard) ----------------------
+// ---------------------- Validation ----------------------
+function validateCourseBody(body) {
+  body.version = 1;
+  body.zones = Array.isArray(body.zones) ? body.zones : [];
+  body.checkpoints = Array.isArray(body.checkpoints) ? body.checkpoints : [];
+  body.phases = Array.isArray(body.phases) ? body.phases : [];
+  if (typeof body.activeWithinSec !== "number") body.activeWithinSec = 60;
+
+  // zones
+  for (const z of body.zones) {
+    if (!z || typeof z !== "object") return "Invalid zone object";
+    if (!z.id || typeof z.id !== "string") return "Zone id required";
+    if (!z.bounds || typeof z.bounds !== "object") return "Zone bounds required";
+    const b = z.bounds;
+    if ([b.south, b.west, b.north, b.east].some((x) => typeof x !== "number")) {
+      return "Zone bounds must be numbers (south,west,north,east)";
+    }
+  }
+
+  // checkpoints
+  for (const c of body.checkpoints) {
+    if (!c || typeof c !== "object") return "Invalid checkpoint object";
+    if (!c.id || typeof c.id !== "string") return "Checkpoint id required";
+    if (typeof c.lat !== "number" || typeof c.lon !== "number") return "Checkpoint lat/lon must be numbers";
+  }
+
+  const zoneIds = new Set(body.zones.map((z) => z.id));
+  const cpIds = new Set(body.checkpoints.map((c) => c.id));
+
+  // phases
+  for (const p of body.phases) {
+    if (!p || typeof p !== "object") return "Invalid phase object";
+    if (!p.id || typeof p.id !== "string") return "Phase id required";
+    if (!p.enter_zone_id || typeof p.enter_zone_id !== "string") return "Phase enter_zone_id required";
+    if (!p.distance_checkpoint_id || typeof p.distance_checkpoint_id !== "string") return "Phase distance_checkpoint_id required";
+    if (!zoneIds.has(p.enter_zone_id)) return "Phase enter_zone_id not found in zones: " + p.enter_zone_id;
+    if (!cpIds.has(p.distance_checkpoint_id)) return "Phase distance_checkpoint_id not found in checkpoints: " + p.distance_checkpoint_id;
+  }
+
+  return null;
+}
+
+// ---------------------- UI ----------------------
 const INDEX_HTML = `<!doctype html>
 <html>
 <head>
@@ -365,8 +393,10 @@ const INDEX_HTML = `<!doctype html>
       box-shadow: 0 6px 18px rgba(0,0,0,0.18);
       width: 410px; max-height: calc(100vh - 20px); overflow:auto;
     }
-    .panel h3{ margin: 0 0 8px 0; font-size: 14px; }
     .row{ display:flex; gap:8px; align-items:center; margin: 6px 0; }
+    .two{ display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+    h3{ margin: 0 0 8px 0; font-size: 14px; }
+
     button{
       border: 1px solid #ddd; background:#fff; padding:6px 8px;
       border-radius:10px; cursor:pointer; font-size:12px;
@@ -374,12 +404,13 @@ const INDEX_HTML = `<!doctype html>
     button.primary{ border-color:#bbb; font-weight:600; }
     button.danger{ border-color:#f0b4b4; color:#a11; }
     button:disabled{ opacity:0.55; cursor:not-allowed; }
-    input[type="text"], input[type="number"], select, textarea{
+
+    input[type="text"], select{
       width: 100%; box-sizing:border-box;
       border:1px solid #ddd; border-radius:10px; padding:6px 8px;
       font-size:12px;
     }
-    textarea{ min-height: 84px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
     .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .muted{ color:#666; font-size:12px; }
     .sep{ height:1px; background:#eee; margin:10px 0; }
@@ -388,9 +419,8 @@ const INDEX_HTML = `<!doctype html>
     .li:last-child{ border-bottom:none; }
     .pill{ font-size:11px; background:#f6f6f6; border:1px solid #eee; padding:2px 6px; border-radius:999px; }
     .hint{ font-size:11px; color:#555; line-height:1.25; }
-    .two{ display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
 
-    /* checkpoint badge (no pin) */
+    /* checkpoint badge */
     .cp-badge{
       width:28px; height:28px;
       border-radius:999px;
@@ -433,9 +463,7 @@ const INDEX_HTML = `<!doctype html>
         <span id="status" class="mono muted">idle</span>
       </div>
 
-      <div class="hint">
-        Loaded/saved layout becomes ACTIVE (scoreboard uses it).
-      </div>
+      <div class="hint">Loaded/saved layout becomes ACTIVE (scoreboard uses it).</div>
 
       <div class="sep"></div>
 
@@ -445,7 +473,7 @@ const INDEX_HTML = `<!doctype html>
         <button id="modeCP">Add Checkpoint</button>
       </div>
       <div class="hint">
-        Rectangle: click SW corner, then click NE corner. (No circles.)<br>
+        Rectangle: click SW corner, then click NE corner.<br>
         Checkpoint: click anywhere to drop a point.
       </div>
 
@@ -490,8 +518,7 @@ const INDEX_HTML = `<!doctype html>
 
       <h3>Phases (Ordered)</h3>
       <div class="hint">
-        Strict order: phase can start only by entering its zone. You can only advance to the NEXT phase
-        by entering the NEXT phase zone, and only if current phase has started.
+        Strict order: start only by entering phase zone. Advance only to NEXT phase zone, only if started.
       </div>
 
       <div class="two">
@@ -543,7 +570,9 @@ const INDEX_HTML = `<!doctype html>
 
     <div class="sep"></div>
     <div class="muted">
-      Endpoints: <span class="mono">/course?name=</span>, <span class="mono">/courses</span>, <span class="mono">/active_course</span>, <span class="mono">/scoreboard</span>
+      Endpoints: <span class="mono">/ingest</span>, <span class="mono">/traccar</span>,
+      <span class="mono">/course?name=</span>, <span class="mono">/courses</span>,
+      <span class="mono">/active_course</span>, <span class="mono">/scoreboard</span>
     </div>
   </div>
 
@@ -566,7 +595,7 @@ const INDEX_HTML = `<!doctype html>
     const el = (id) => document.getElementById(id);
     const setStatus = (s) => el("status").textContent = s;
 
-    // collapse/expand course tool
+    // toggle course tool
     let courseVisible = true;
     el("btnToggleCourse").onclick = () => {
       courseVisible = !courseVisible;
@@ -613,19 +642,18 @@ const INDEX_HTML = `<!doctype html>
     }
 
     function makeCpIcon(text) {
-      const t = (text || "").toString().slice(0, 2);
+      const t = (text || "").toString().slice(0,2);
       return L.divIcon({
         className: "",
         html: "<div class='cp-badge'>" + t + "</div>",
-        iconSize: [28, 28],
-        iconAnchor: [14, 14],
+        iconSize: [28,28],
+        iconAnchor: [14,14],
       });
     }
 
     function upsertCheckpointLayer(cp) {
       let m = cpLayers.get(cp.id);
-      const label = (cp.id || "").slice(0, 2);
-
+      const label = (cp.id || "").slice(0,2);
       if (!m) {
         m = L.marker([cp.lat, cp.lon], { icon: makeCpIcon(label) }).addTo(map);
         cpLayers.set(cp.id, m);
@@ -633,7 +661,6 @@ const INDEX_HTML = `<!doctype html>
         m.setLatLng([cp.lat, cp.lon]);
         m.setIcon(makeCpIcon(label));
       }
-
       m.bindPopup("<b>" + cp.id + "</b><br>" + (cp.name||"") + "<br>" + cp.lat.toFixed(6) + "," + cp.lon.toFixed(6));
     }
 
@@ -663,6 +690,7 @@ const INDEX_HTML = `<!doctype html>
         const div = document.createElement("div");
         div.className = "li";
         div.innerHTML = "<div><span class='mono'>" + z.id + "</span> <span class='muted'>(" + (z.name||"") + ")</span></div>";
+
         const right = document.createElement("div");
         right.style.display = "flex";
         right.style.gap = "6px";
@@ -706,6 +734,7 @@ const INDEX_HTML = `<!doctype html>
         div.innerHTML =
           "<div><span class='mono'>" + cp.id + "</span> <span class='muted'>(" + (cp.name||"") + ")</span> " +
           "<span class='pill'>" + cp.lat.toFixed(5) + "," + cp.lon.toFixed(5) + "</span></div>";
+
         const right = document.createElement("div");
         right.style.display = "flex";
         right.style.gap = "6px";
@@ -828,7 +857,7 @@ const INDEX_HTML = `<!doctype html>
       });
     }
 
-    // --- modes ---
+    // modes
     let mode = "none"; // none|rect|cp
     let rectClicks = [];
 
@@ -845,10 +874,9 @@ const INDEX_HTML = `<!doctype html>
       el("btnClearRect").disabled = true;
     }
 
-    el("modeNone").onclick = () => { setMode("none"); };
+    el("modeNone").onclick = () => setMode("none");
     el("modeRect").onclick = () => { setMode("rect"); resetRectClicks(); };
-    el("modeCP").onclick = () => { setMode("cp"); };
-
+    el("modeCP").onclick = () => setMode("cp");
     el("btnClearRect").onclick = () => { resetRectClicks(); setStatus("rect cancelled"); };
 
     map.on("click", (e) => {
@@ -856,6 +884,7 @@ const INDEX_HTML = `<!doctype html>
         rectClicks.push(e.latlng);
         el("rectClicks").textContent = String(rectClicks.length);
         el("btnClearRect").disabled = false;
+
         if (rectClicks.length === 2) {
           const zId = (el("zoneId").value || "").trim();
           const zName = (el("zoneName").value || "").trim();
@@ -872,7 +901,6 @@ const INDEX_HTML = `<!doctype html>
           renderZonesList();
           renderPhaseSelects();
 
-          // auto next
           const nextZ = nextZoneId();
           el("zoneId").value = nextZ;
           el("zoneName").value = "Area " + nextZ.replace("Z","");
@@ -899,8 +927,8 @@ const INDEX_HTML = `<!doctype html>
         const nextC = nextCheckpointId();
         el("cpId").value = nextC;
         el("cpName").value = "CP " + nextC;
+
         setStatus("checkpoint saved (local)");
-        return;
       }
     });
 
@@ -950,15 +978,11 @@ const INDEX_HTML = `<!doctype html>
         });
 
         const cur = (el("layoutName").value || "default").trim() || "default";
-        sel.value = names.includes(cur) ? cur : (names.includes("default") ? "default" : names[0]);
+        sel.value = names.includes(cur) ? cur : "default";
       } catch {}
     }
-
     el("btnRefreshLayouts").onclick = refreshLayouts;
-
-    el("layoutSelect").onchange = () => {
-      el("layoutName").value = el("layoutSelect").value;
-    };
+    el("layoutSelect").onchange = () => { el("layoutName").value = el("layoutSelect").value; };
 
     async function setActiveLayout(name) {
       try {
@@ -970,7 +994,7 @@ const INDEX_HTML = `<!doctype html>
       } catch {}
     }
 
-    // load/save course
+    // load/save
     el("btnLoad").onclick = async () => {
       try {
         const name = (el("layoutName").value || "default").trim() || "default";
@@ -979,12 +1003,14 @@ const INDEX_HTML = `<!doctype html>
         if (!r.ok) throw new Error("HTTP " + r.status);
         const d = await r.json();
 
-        course.version = 1;
-        course.name = d.name || name;
-        course.zones = Array.isArray(d.zones) ? d.zones : [];
-        course.checkpoints = Array.isArray(d.checkpoints) ? d.checkpoints : [];
-        course.phases = Array.isArray(d.phases) ? d.phases : [];
-        course.activeWithinSec = (typeof d.activeWithinSec === "number") ? d.activeWithinSec : 60;
+        course = {
+          version: 1,
+          name: d.name || name,
+          zones: Array.isArray(d.zones) ? d.zones : [],
+          checkpoints: Array.isArray(d.checkpoints) ? d.checkpoints : [],
+          phases: Array.isArray(d.phases) ? d.phases : [],
+          activeWithinSec: (typeof d.activeWithinSec === "number") ? d.activeWithinSec : 60,
+        };
 
         redrawCourse();
         await setActiveLayout(course.name);
@@ -1018,7 +1044,7 @@ const INDEX_HTML = `<!doctype html>
       }
     };
 
-    // --- hidden devices ---
+    // hidden devices
     async function loadHidden() {
       try {
         const r = await fetch(API + "/hidden_devices");
@@ -1064,7 +1090,7 @@ const INDEX_HTML = `<!doctype html>
       });
     }
 
-    // --- scoreboard ---
+    // scoreboard map markers
     function upsertRacerMarker(device_id, lat, lon, label) {
       let m = racerMarkers.get(device_id);
       const ll = [lat, lon];
@@ -1139,7 +1165,6 @@ const INDEX_HTML = `<!doctype html>
         const active = d.active_count ?? 0;
 
         for (const id of hiddenSet) removeRacerMarker(id);
-
         renderScore(items, active);
       } catch {}
     }
@@ -1147,10 +1172,7 @@ const INDEX_HTML = `<!doctype html>
     // init
     setMode("none");
     resetRectClicks();
-    renderZonesList();
-    renderCpsList();
-    renderPhaseSelects();
-    renderPhases();
+    redrawCourse();
     loadHidden();
     refreshLayouts();
     tickScore();
@@ -1159,56 +1181,12 @@ const INDEX_HTML = `<!doctype html>
 </body>
 </html>`;
 
-// ---------------------- Validation ----------------------
-function validateCourseBody(body) {
-  body.version = 1;
-  body.zones = Array.isArray(body.zones) ? body.zones : [];
-  body.checkpoints = Array.isArray(body.checkpoints) ? body.checkpoints : [];
-  body.phases = Array.isArray(body.phases) ? body.phases : [];
-  if (typeof body.activeWithinSec !== "number") body.activeWithinSec = 60;
-
-  // Validate zones: rectangles only
-  for (const z of body.zones) {
-    if (!z || typeof z !== "object") return "Invalid zone object";
-    if (!z.id || typeof z.id !== "string") return "Zone id required";
-    if (!z.bounds || typeof z.bounds !== "object") return "Zone bounds required";
-    const b = z.bounds;
-    if ([b.south, b.west, b.north, b.east].some((x) => typeof x !== "number")) {
-      return "Zone bounds must be numbers (south,west,north,east)";
-    }
-  }
-
-  // Validate checkpoints
-  for (const c of body.checkpoints) {
-    if (!c || typeof c !== "object") return "Invalid checkpoint object";
-    if (!c.id || typeof c.id !== "string") return "Checkpoint id required";
-    if (typeof c.lat !== "number" || typeof c.lon !== "number") return "Checkpoint lat/lon must be numbers";
-  }
-
-  const zoneIds = new Set(body.zones.map((z) => z.id));
-  const cpIds = new Set(body.checkpoints.map((c) => c.id));
-
-  // Validate phases
-  for (const p of body.phases) {
-    if (!p || typeof p !== "object") return "Invalid phase object";
-    if (!p.id || typeof p.id !== "string") return "Phase id required";
-    if (!p.enter_zone_id || typeof p.enter_zone_id !== "string") return "Phase enter_zone_id required";
-    if (!p.distance_checkpoint_id || typeof p.distance_checkpoint_id !== "string") return "Phase distance_checkpoint_id required";
-    if (!zoneIds.has(p.enter_zone_id)) return "Phase enter_zone_id not found in zones: " + p.enter_zone_id;
-    if (!cpIds.has(p.distance_checkpoint_id)) return "Phase distance_checkpoint_id not found in checkpoints: " + p.distance_checkpoint_id;
-  }
-
-  return null;
-}
-
 // ---------------------- Worker fetch ----------------------
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    if (MAINTENANCE_MODE) {
-      return text("Service paused (maintenance mode)", 503);
-    }
+    if (MAINTENANCE_MODE) return text("Service paused (maintenance mode)", 503);
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
@@ -1222,18 +1200,18 @@ export default {
       });
     }
 
-    // Health
+    // health
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, server_time_ms: nowMs() });
     }
 
-    // List layouts
+    // list layouts
     if (request.method === "GET" && url.pathname === "/courses") {
       const names = await listCourses(env);
       return json({ ok: true, names });
     }
 
-    // Active layout getter/setter
+    // active layout
     if (url.pathname === "/active_course") {
       if (request.method === "GET") {
         const name = await getActiveCourseName(env);
@@ -1249,7 +1227,7 @@ export default {
       return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
-    // Hidden devices
+    // hidden devices
     if (url.pathname === "/hidden_devices") {
       if (request.method === "GET") {
         const hidden = await getHiddenDevices(env);
@@ -1275,7 +1253,7 @@ export default {
       return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
-    // Course management (multi-layout)
+    // course (multi-layout)
     if (url.pathname === "/course") {
       const name = normalizeCourseName(url.searchParams.get("name") || "default");
 
@@ -1298,18 +1276,30 @@ export default {
       return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
-    // Ingest (JSON)
+    // ingest: accepts your format
     if (request.method === "POST" && url.pathname === "/ingest") {
       let body;
-      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      try { body = await request.json(); }
+      catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
 
-      const device_id = String(body.device_id || "").trim();
+      // Accept:
+      // 1) {id, lat, lon, alt, acc, spd, time}
+      // 2) {device_id, lat, lon, t_ms}
+      const device_id = String(body.device_id ?? body.id ?? "").trim();
       const lat = Number(body.lat);
       const lon = Number(body.lon);
-      const t_ms = body.t_ms != null ? Number(body.t_ms) : nowMs();
 
-      if (!device_id) return json({ ok: false, error: "device_id required" }, 400);
+      const t_ms =
+        body.t_ms != null ? Number(body.t_ms) :
+        body.time != null ? Number(body.time) :
+        nowMs();
+
+      if (!device_id) return json({ ok: false, error: "device_id/id required" }, 400);
       if (!Number.isFinite(lat) || !Number.isFinite(lon)) return json({ ok: false, error: "lat/lon required" }, 400);
+
+      const alt = asNumberOrNull(body.alt);
+      const acc = asNumberOrNull(body.acc);
+      const spd = asNumberOrNull(body.spd);
 
       const entry = {
         device_id,
@@ -1317,6 +1307,9 @@ export default {
         lat,
         lon,
         received_at_ms: nowMs(),
+        ...(alt != null ? { alt } : {}),
+        ...(acc != null ? { acc } : {}),
+        ...(spd != null ? { spd } : {}),
       };
 
       await saveLatestAndRegisterDevice(env, entry);
@@ -1327,7 +1320,7 @@ export default {
       return json({ ok: true });
     }
 
-    // Traccar adapter (GET/POST)
+    // traccar adapter (GET/POST)
     if (url.pathname === "/traccar") {
       if (request.method === "GET") {
         const device_id = String(url.searchParams.get("device_id") || url.searchParams.get("id") || "").trim();
@@ -1360,6 +1353,7 @@ export default {
         let body;
         try { body = await request.json(); } catch { return text("ERR: invalid JSON", 400); }
 
+        // Try flexible shapes
         const p = body && body.location ? body.location : body;
         const c = p && p.coords ? p.coords : p;
 
@@ -1369,9 +1363,8 @@ export default {
 
         let t_ms = nowMs();
         const ts = p?.timestamp ?? p?.time ?? p?.t_ms;
-        if (typeof ts === "number") {
-          t_ms = ts > 1e12 ? ts : ts * 1000;
-        } else if (typeof ts === "string") {
+        if (typeof ts === "number") t_ms = ts > 1e12 ? ts : ts * 1000;
+        else if (typeof ts === "string") {
           const parsed = Date.parse(ts);
           if (!Number.isNaN(parsed)) t_ms = parsed;
         }
@@ -1388,12 +1381,12 @@ export default {
       return text("Method not allowed", 405);
     }
 
-    // latest_all (filtered by hidden)
+    // latest_all (excluding hidden)
     if (request.method === "GET" && url.pathname === "/latest_all") {
       const hidden = new Set(await getHiddenDevices(env));
-
       const devicesRaw = await env.GPS_KV.get(KV_DEVICES_KEY);
       const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
+
       const items = [];
       for (const id of devices) {
         if (hidden.has(id)) continue;
@@ -1404,19 +1397,7 @@ export default {
       return json({ server_time_ms: nowMs(), items });
     }
 
-    // latest (single)
-    if (request.method === "GET" && url.pathname === "/latest") {
-      const device_id = String(url.searchParams.get("device_id") || "").trim();
-      if (!device_id) return json({ ok: false, error: "device_id required" }, 400);
-
-      const raw = await env.GPS_KV.get(KV_LATEST_PREFIX + device_id);
-      if (!raw) return json({ device_id, lat: null, lon: null, t_ms: null, received_at_ms: null });
-
-      try { return json(JSON.parse(raw)); }
-      catch { return json({ ok: false, error: "Corrupt data" }, 500); }
-    }
-
-    // Scoreboard (uses ACTIVE layout)
+    // scoreboard (uses ACTIVE layout)
     if (request.method === "GET" && url.pathname === "/scoreboard") {
       const course = await getActiveCourse(env);
       const serverTimeMs = nowMs();
@@ -1428,7 +1409,6 @@ export default {
       const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
 
       const out = [];
-
       for (const id of devices) {
         if (hiddenSet.has(id)) continue;
 
@@ -1444,30 +1424,22 @@ export default {
           try { state = JSON.parse(stateRaw); } catch {}
         }
 
-        // If state missing but latest exists, initialize/update once
+        // bootstrap if missing state
         if (!state && latest && typeof latest.lat === "number" && typeof latest.lon === "number") {
           const u = await updateRaceState(env, course, id, latest.lat, latest.lon, latest.received_at_ms ?? serverTimeMs);
           state = u.state;
         }
 
         const progress = computeProgress(course, state, latest, serverTimeMs);
-
-        out.push({
-          device_id: id,
-          latest,
-          state,
-          progress,
-        });
+        out.push({ device_id: id, latest, state, progress });
       }
 
       out.sort(compareRank);
 
-      const activeCount = out.filter((x) => x.progress.isActive).length;
-
       return json({
         server_time_ms: serverTimeMs,
         active_course: course.name || (await getActiveCourseName(env)),
-        active_count: activeCount,
+        active_count: out.filter((x) => x.progress.isActive).length,
         items: out,
       });
     }
