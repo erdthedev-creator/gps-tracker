@@ -1,13 +1,11 @@
 /**
- * gps-tracker Worker (HTTP ingest + KV storage + scoreboard)
- *
- * Adds:
- *  - KV course storage key "course:active"
- *  - KV race state per device: key "race_state:<device_id>"
- *  - GET /course, POST /course
- *  - GET /scoreboard
- *
- * Rectangular zones only (no circles).
+ * gps-tracker Worker
+ * - Ingest GPS (HTTP)
+ * - Store latest per device in KV
+ * - Course editor (rect zones + checkpoints + ordered phases)
+ * - Phase-based progress (strict order, no skipping; phaseStarted required to advance)
+ * - Scoreboard
+ * - Hide/Unhide devices (removes from map + scoreboard)
  */
 
 const MAINTENANCE_MODE = false;
@@ -17,8 +15,9 @@ const KV_COURSE_KEY = "course:active";
 const KV_DEVICES_KEY = "devices";
 const KV_LATEST_PREFIX = "latest:";
 const KV_STATE_PREFIX = "race_state:";
+const KV_HIDDEN_DEVICES_KEY = "hidden:devices";
 
-// --- helpers ---
+// ---------------------- Helpers ----------------------
 function corsHeaders() {
   return {
     "Access-Control-Allow-Origin": "*",
@@ -67,7 +66,6 @@ function haversineMeters(lat1, lon1, lat2, lon2) {
   return R * c;
 }
 
-// Rect bounds check
 // bounds: { south, west, north, east }
 function pointInRect(lat, lon, bounds) {
   if (!bounds) return false;
@@ -76,21 +74,23 @@ function pointInRect(lat, lon, bounds) {
   return lat >= south && lat <= north && lon >= west && lon <= east;
 }
 
-// Get active course (or default)
+// ---------------------- Course / Hidden ----------------------
 async function getCourse(env) {
   const raw = await env.GPS_KV.get(KV_COURSE_KEY);
   if (!raw) {
     return {
       version: 1,
-      zones: [],   // [{id,name,bounds:{south,west,north,east}}]
-      phases: [],  // [{id,name,expected_sequence:["Z1","Z2"], ranking_anchor:{lat,lon}}]
-      activeWithinSec: 60, // for "active" calculation in scoreboard
+      zones: [],        // [{id,name,bounds:{south,west,north,east}}]
+      checkpoints: [],  // [{id,name,lat,lon}]
+      phases: [],       // ordered list: [{id,name,enter_zone_id,distance_checkpoint_id}]
+      activeWithinSec: 60,
     };
   }
   try {
     const v = JSON.parse(raw);
-    // minimal sanity
+    v.version = 1;
     v.zones = Array.isArray(v.zones) ? v.zones : [];
+    v.checkpoints = Array.isArray(v.checkpoints) ? v.checkpoints : [];
     v.phases = Array.isArray(v.phases) ? v.phases : [];
     if (typeof v.activeWithinSec !== "number") v.activeWithinSec = 60;
     return v;
@@ -98,6 +98,7 @@ async function getCourse(env) {
     return {
       version: 1,
       zones: [],
+      checkpoints: [],
       phases: [],
       activeWithinSec: 60,
     };
@@ -108,14 +109,21 @@ async function saveCourse(env, courseObj) {
   await env.GPS_KV.put(KV_COURSE_KEY, JSON.stringify(courseObj));
 }
 
-// Save latest + register device
+async function getHiddenDevices(env) {
+  const raw = await env.GPS_KV.get(KV_HIDDEN_DEVICES_KEY);
+  return raw ? safeJsonParseArray(raw) : [];
+}
+
+async function setHiddenDevices(env, arr) {
+  await env.GPS_KV.put(KV_HIDDEN_DEVICES_KEY, JSON.stringify(arr));
+}
+
+// ---------------------- Device data ----------------------
 async function saveLatestAndRegisterDevice(env, entry) {
   const deviceId = entry.device_id;
 
-  // latest:<device_id>
   await env.GPS_KV.put(KV_LATEST_PREFIX + deviceId, JSON.stringify(entry));
 
-  // devices list
   const devicesRaw = await env.GPS_KV.get(KV_DEVICES_KEY);
   const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
   if (!devices.includes(deviceId)) {
@@ -124,7 +132,7 @@ async function saveLatestAndRegisterDevice(env, entry) {
   }
 }
 
-// Detect current zone by course rectangles (first match)
+// detect zone by course rectangles (first match)
 function detectZoneId(course, lat, lon) {
   for (const z of course.zones || []) {
     if (z && z.bounds && pointInRect(lat, lon, z.bounds)) {
@@ -134,31 +142,31 @@ function detectZoneId(course, lat, lon) {
   return null;
 }
 
-// Load and update race state based on zone enter events
+// ---------------------- Phase-based State Machine ----------------------
+/**
+ * Strict rules:
+ * - Phase k starts ONLY when entering phases[k].enter_zone_id
+ * - Advance ONLY to phase k+1 by entering phases[k+1].enter_zone_id
+ * - And ONLY if current phase is started (phaseStarted=true). (No skipping, no "free advance")
+ */
 async function updateRaceState(env, course, deviceId, lat, lon, receivedAtMs) {
   const key = KV_STATE_PREFIX + deviceId;
   const raw = await env.GPS_KV.get(key);
   let state;
-  try {
-    state = raw ? JSON.parse(raw) : null;
-  } catch {
-    state = null;
-  }
+  try { state = raw ? JSON.parse(raw) : null; } catch { state = null; }
 
   if (!state) {
     state = {
       device_id: deviceId,
       phaseIndex: 0,
-      seqIndex: -1,      // -1 means "not started in phase yet"
+      phaseStarted: false,
       lastZoneId: null,
       lastUpdateMs: receivedAtMs,
-      history: [],       // last few entered zones
+      history: [],
     };
   }
 
   const zoneIdNow = detectZoneId(course, lat, lon);
-
-  // "enter" event = zone changed and new zone is not null
   const entered = zoneIdNow && zoneIdNow !== state.lastZoneId;
 
   if (entered) {
@@ -166,88 +174,76 @@ async function updateRaceState(env, course, deviceId, lat, lon, receivedAtMs) {
     if (state.history.length > 20) state.history.shift();
 
     const phases = course.phases || [];
-    const phase = phases[state.phaseIndex] || null;
+    const cur = phases[state.phaseIndex] || null;
+    const next = phases[state.phaseIndex + 1] || null;
 
-    if (phase && Array.isArray(phase.expected_sequence)) {
-      const seq = phase.expected_sequence;
-
-      // next expected zone depends on seqIndex
-      const nextExpected = seq[state.seqIndex + 1];
-
-      if (zoneIdNow === nextExpected) {
-        state.seqIndex += 1;
-
-        // phase completed?
-        if (state.seqIndex >= seq.length - 1) {
-          // complete phase -> advance
-          state.phaseIndex += 1;
-          state.seqIndex = -1; // not started in next phase yet
-        }
-      } else {
-        // Optional: if user enters the first expected zone while seqIndex is -1, accept it
-        if (state.seqIndex === -1 && zoneIdNow === seq[0]) {
-          state.seqIndex = 0;
-        }
-        // Otherwise ignore unexpected enters (keeps state)
-      }
+    // Start current phase by entering its enter zone
+    if (cur && cur.enter_zone_id && zoneIdNow === cur.enter_zone_id) {
+      state.phaseStarted = true;
     }
+
+    // Advance ONLY to the next phase, and ONLY if current phase is started
+    if (
+      next &&
+      next.enter_zone_id &&
+      zoneIdNow === next.enter_zone_id &&
+      state.phaseStarted === true
+    ) {
+      state.phaseIndex += 1;
+      state.phaseStarted = true; // because we entered next phase's start zone
+    }
+
+    // Any later phase zone enters are ignored (no skipping) because we only check "next"
   }
 
   state.lastZoneId = zoneIdNow;
   state.lastUpdateMs = receivedAtMs;
 
   await env.GPS_KV.put(key, JSON.stringify(state));
-
   return { state, zoneIdNow, entered };
 }
 
-// Compute rank metrics for device
 function computeProgress(course, state, latest, serverTimeMs) {
   const phases = course.phases || [];
+  const checkpoints = course.checkpoints || [];
+
   const phaseIndex = typeof state?.phaseIndex === "number" ? state.phaseIndex : 0;
-  const seqIndex = typeof state?.seqIndex === "number" ? state.seqIndex : -1;
+  const phaseStarted = !!state?.phaseStarted;
 
-  // Use current phase anchor if exists, else no distance metric
-  const phase = phases[phaseIndex] || null;
+  const ph = phases[phaseIndex] || null;
+
   let distM = null;
-
   if (
-    phase &&
-    phase.ranking_anchor &&
-    typeof phase.ranking_anchor.lat === "number" &&
-    typeof phase.ranking_anchor.lon === "number" &&
-    typeof latest?.lat === "number" &&
-    typeof latest?.lon === "number"
+    ph &&
+    ph.distance_checkpoint_id &&
+    latest &&
+    typeof latest.lat === "number" &&
+    typeof latest.lon === "number"
   ) {
-    distM = haversineMeters(
-      latest.lat,
-      latest.lon,
-      phase.ranking_anchor.lat,
-      phase.ranking_anchor.lon
-    );
+    const cp = checkpoints.find((c) => c.id === ph.distance_checkpoint_id);
+    if (cp && typeof cp.lat === "number" && typeof cp.lon === "number") {
+      distM = haversineMeters(latest.lat, latest.lon, cp.lat, cp.lon);
+    }
   }
 
   const lastSeen = latest?.received_at_ms ?? state?.lastUpdateMs ?? null;
   const activeWithinMs = (course.activeWithinSec || 60) * 1000;
   const isActive = typeof lastSeen === "number" ? (serverTimeMs - lastSeen) < activeWithinMs : false;
 
-  return {
-    phaseIndex,
-    seqIndex,
-    distM,
-    isActive,
-    lastSeen,
-  };
+  return { phaseIndex, phaseStarted, distM, isActive, lastSeen };
 }
 
-// Sort: higher phaseIndex first, higher seqIndex first, then smaller distM, then newer lastSeen
 function compareRank(a, b) {
   if (a.progress.phaseIndex !== b.progress.phaseIndex) return b.progress.phaseIndex - a.progress.phaseIndex;
-  if (a.progress.seqIndex !== b.progress.seqIndex) return b.progress.seqIndex - a.progress.seqIndex;
 
-  // distM can be null
+  // same phase: started first
+  if (a.progress.phaseStarted !== b.progress.phaseStarted) {
+    return (b.progress.phaseStarted ? 1 : 0) - (a.progress.phaseStarted ? 1 : 0);
+  }
+
   const ad = a.progress.distM;
   const bd = b.progress.distM;
+
   if (ad == null && bd != null) return 1;
   if (ad != null && bd == null) return -1;
   if (ad != null && bd != null && ad !== bd) return ad - bd;
@@ -257,12 +253,12 @@ function compareRank(a, b) {
   return bl - al;
 }
 
-// --- UI HTML (simple scoreboard panel) ---
+// ---------------------- UI (Editor + Scoreboard) ----------------------
 const INDEX_HTML = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>GPS Tracker • Course Editor + Scoreboard</title>
+  <title>GPS Tracker • Course Tool + Scoreboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
@@ -275,11 +271,10 @@ const INDEX_HTML = `<!doctype html>
       padding: 10px; border-radius: 12px;
       font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
       box-shadow: 0 6px 18px rgba(0,0,0,0.18);
-      width: 360px; max-height: calc(100vh - 20px); overflow:auto;
+      width: 380px; max-height: calc(100vh - 20px); overflow:auto;
     }
     .panel h3{ margin: 0 0 8px 0; font-size: 14px; }
     .row{ display:flex; gap:8px; align-items:center; margin: 6px 0; }
-    .row label{ font-size:12px; color:#333; }
     button{
       border: 1px solid #ddd; background:#fff; padding:6px 8px;
       border-radius:10px; cursor:pointer; font-size:12px;
@@ -292,7 +287,7 @@ const INDEX_HTML = `<!doctype html>
       border:1px solid #ddd; border-radius:10px; padding:6px 8px;
       font-size:12px;
     }
-    textarea{ min-height: 90px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    textarea{ min-height: 84px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .mono{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
     .muted{ color:#666; font-size:12px; }
     .sep{ height:1px; background:#eee; margin:10px 0; }
@@ -300,26 +295,24 @@ const INDEX_HTML = `<!doctype html>
     .li{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:4px 0; border-bottom: 1px dashed #eee; }
     .li:last-child{ border-bottom:none; }
     .pill{ font-size:11px; background:#f6f6f6; border:1px solid #eee; padding:2px 6px; border-radius:999px; }
-    .scoreItem{ padding:4px 0; border-bottom:1px dashed #eee; }
-    .scoreItem:last-child{ border-bottom:none; }
-    .two{ display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
     .hint{ font-size:11px; color:#555; line-height:1.25; }
+    .two{ display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
   </style>
 </head>
 <body>
   <div id="map"></div>
 
   <div class="panel">
-    <h3>Course Editor</h3>
+    <h3>Course Tool</h3>
 
     <div class="row">
-      <button id="btnLoad" class="primary">Load Course</button>
-      <button id="btnSave" class="primary">Save Course</button>
+      <button id="btnLoad" class="primary">Load</button>
+      <button id="btnSave" class="primary">Save</button>
       <span id="status" class="mono muted">idle</span>
     </div>
 
     <div class="row">
-      <button id="modeNone">Mode: View</button>
+      <button id="modeNone">Mode: View ✓</button>
       <button id="modeRect">Draw Rectangle</button>
       <button id="modeCP">Add Checkpoint</button>
     </div>
@@ -332,77 +325,76 @@ const INDEX_HTML = `<!doctype html>
 
     <div class="two">
       <div>
-        <label>New Zone ID</label>
-        <input id="zoneId" type="text" placeholder="Z1" value="Z1" />
+        <label class="muted">New Zone ID</label>
+        <input id="zoneId" type="text" value="Z1" />
       </div>
       <div>
-        <label>New Zone Name</label>
-        <input id="zoneName" type="text" placeholder="Area 1" value="Area 1" />
+        <label class="muted">New Zone Name</label>
+        <input id="zoneName" type="text" value="Area 1" />
       </div>
     </div>
 
     <div class="row">
       <button id="btnClearRect" class="danger" disabled>Cancel Rectangle</button>
-      <span class="muted">Pending clicks: <span id="rectClicks">0</span>/2</span>
+      <span class="muted">Clicks: <span id="rectClicks">0</span>/2</span>
     </div>
 
-    <label>Zones (Rectangles)</label>
+    <label class="muted">Zones</label>
     <div id="zonesList" class="list"></div>
 
     <div class="sep"></div>
 
     <div class="two">
       <div>
-        <label>New Checkpoint ID</label>
-        <input id="cpId" type="text" placeholder="A" value="A" />
+        <label class="muted">New CP ID</label>
+        <input id="cpId" type="text" value="A" />
       </div>
       <div>
-        <label>New Checkpoint Name</label>
-        <input id="cpName" type="text" placeholder="Start" value="Start" />
+        <label class="muted">New CP Name</label>
+        <input id="cpName" type="text" value="Start" />
       </div>
     </div>
 
-    <label>Checkpoints</label>
+    <label class="muted">Checkpoints</label>
     <div id="cpsList" class="list"></div>
 
     <div class="sep"></div>
 
-    <h3>Phases Tool</h3>
+    <h3>Phases (Ordered)</h3>
     <div class="hint">
-      Phase = (Expected zone sequence) + (Anchor checkpoint for distance tie-break).<br>
-      Rank uses: phaseIndex desc, seqIndex desc, then distance-to-anchor asc.
+      Strict order: phase can start only by entering its zone. You can only advance to the NEXT phase
+      by entering the NEXT phase zone, and only if current phase has started.
     </div>
 
     <div class="two">
       <div>
-        <label>Phase ID</label>
-        <input id="phId" type="text" value="phase0" />
+        <label class="muted">Phase ID</label>
+        <input id="phId" type="text" value="p1" />
       </div>
       <div>
-        <label>Phase Name</label>
-        <input id="phName" type="text" value="Outbound" />
+        <label class="muted">Phase Name</label>
+        <input id="phName" type="text" value="Stage 1" />
       </div>
     </div>
 
     <div class="row">
       <div style="flex:1">
-        <label>Anchor Checkpoint</label>
-        <select id="phAnchor"></select>
+        <label class="muted">Enter Zone</label>
+        <select id="phZone"></select>
       </div>
       <div style="flex:1">
-        <label>Zone Sequence (comma)</label>
-        <input id="phSeq" type="text" placeholder="Z1,Z2,Z3" value="Z1,Z2,Z3" />
+        <label class="muted">Distance CP</label>
+        <select id="phCP"></select>
       </div>
     </div>
 
     <div class="row">
-      <button id="btnAddPhase">Add/Update Phase</button>
+      <button id="btnUpsertPhase">Add/Update Phase</button>
       <button id="btnDelPhase" class="danger">Delete Phase</button>
     </div>
 
-    <label>Phases (JSON preview)</label>
-    <textarea id="phasesJson" spellcheck="false"></textarea>
-    <div class="muted">You can edit this JSON manually if you want; it will be used on Save.</div>
+    <label class="muted">Phase List</label>
+    <div id="phList" class="list"></div>
 
     <div class="sep"></div>
 
@@ -410,12 +402,19 @@ const INDEX_HTML = `<!doctype html>
     <div class="row muted">
       <div>Active: <span id="activeCount" class="mono">-</span></div>
       <div>Total: <span id="totalCount" class="mono">-</span></div>
+      <div>Hidden: <span id="hiddenCount" class="mono">-</span></div>
     </div>
     <div id="scoreList" class="list"></div>
 
     <div class="sep"></div>
+
+    <h3>Hidden Devices</h3>
+    <div class="hint">Hidden devices are excluded from map + scoreboard.</div>
+    <div id="hiddenList" class="list"></div>
+
+    <div class="sep"></div>
     <div class="muted">
-      Endpoints: <span class="mono">/course</span>, <span class="mono">/scoreboard</span>
+      Endpoints: <span class="mono">/course</span>, <span class="mono">/scoreboard</span>, <span class="mono">/hidden_devices</span>
     </div>
   </div>
 
@@ -423,84 +422,92 @@ const INDEX_HTML = `<!doctype html>
   <script>
     const API = location.origin;
 
-    // --- map ---
     const map = L.map("map").setView([41.086, 29.047], 12);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       attribution: "&copy; OpenStreetMap contributors",
     }).addTo(map);
 
-    // --- in-memory course model (authoritative copy is KV via /course) ---
-    let course = {
-      version: 1,
-      zones: [],        // [{id,name,bounds:{south,west,north,east}}]
-      checkpoints: [],  // [{id,name,lat,lon}]
-      phases: [],       // [{id,name,expected_sequence:[...], ranking_anchor:{lat,lon}}]
-      activeWithinSec: 60
-    };
+    let course = { version:1, zones:[], checkpoints:[], phases:[], activeWithinSec:60 };
 
-    // layers
     const zoneLayers = new Map(); // zoneId -> L.rectangle
     const cpLayers = new Map();   // cpId -> L.marker
-    const markers = new Map();    // device_id -> L.marker (live racers)
+    const racerMarkers = new Map(); // device_id -> L.marker
 
-    // --- UI helpers ---
+    let hiddenSet = new Set();
+
     const el = (id) => document.getElementById(id);
     const setStatus = (s) => el("status").textContent = s;
 
-    function nextId(prefix, existingIds) {
-      // Z1, Z2... or A,B...
-      if (prefix === "Z") {
-        let n = 1;
-        while (existingIds.has("Z" + n)) n++;
-        return "Z" + n;
-      }
-      // for checkpoints default: A,B,C...
-      const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
-      for (let i=0; i<alphabet.length; i++) {
-        const cand = alphabet[i];
-        if (!existingIds.has(cand)) return cand;
-      }
-      return prefix + "_" + Math.floor(Math.random()*1000);
+    function nextZoneId() {
+      const ids = new Set(course.zones.map(z => z.id));
+      let n = 1;
+      while (ids.has("Z" + n)) n++;
+      return "Z" + n;
     }
 
-    function renderAnchorSelect() {
-      const sel = el("phAnchor");
-      sel.innerHTML = "";
-      for (const cp of course.checkpoints) {
-        const opt = document.createElement("option");
-        opt.value = cp.id;
-        opt.textContent = cp.id + " — " + (cp.name || "");
-        sel.appendChild(opt);
+    function nextCheckpointId() {
+      const ids = new Set(course.checkpoints.map(c => c.id));
+      const abc = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+      for (let i=0; i<abc.length; i++) {
+        if (!ids.has(abc[i])) return abc[i];
       }
-      if (sel.options.length === 0) {
-        const opt = document.createElement("option");
-        opt.value = "";
-        opt.textContent = "(no checkpoints yet)";
-        sel.appendChild(opt);
+      return "C" + Math.floor(Math.random()*1000);
+    }
+
+    function clampBounds(sw, ne) {
+      const south = Math.min(sw.lat, ne.lat);
+      const north = Math.max(sw.lat, ne.lat);
+      const west  = Math.min(sw.lng, ne.lng);
+      const east  = Math.max(sw.lng, ne.lng);
+      return { south, west, north, east };
+    }
+
+    function upsertZoneLayer(z) {
+      const b = z.bounds;
+      const bounds = [[b.south, b.west], [b.north, b.east]];
+      let r = zoneLayers.get(z.id);
+      if (!r) {
+        r = L.rectangle(bounds, {weight:2});
+        r.addTo(map);
+        r.bindTooltip(z.id, {permanent:true, direction:"center"});
+        zoneLayers.set(z.id, r);
+      } else {
+        r.setBounds(bounds);
       }
     }
 
-    function renderPhasesJson() {
-      el("phasesJson").value = JSON.stringify(course.phases, null, 2);
+    function upsertCheckpointLayer(cp) {
+      let m = cpLayers.get(cp.id);
+      if (!m) {
+        m = L.marker([cp.lat, cp.lon]).addTo(map);
+        cpLayers.set(cp.id, m);
+      } else {
+        m.setLatLng([cp.lat, cp.lon]);
+      }
+      m.bindTooltip(cp.id, {permanent:true, direction:"top", offset:[0,-12]});
+      m.bindPopup("<b>" + cp.id + "</b><br>" + (cp.name||"") + "<br>" + cp.lat.toFixed(6) + "," + cp.lon.toFixed(6));
     }
 
-    function loadPhasesJsonFromTextarea() {
-      try {
-        const v = JSON.parse(el("phasesJson").value || "[]");
-        if (!Array.isArray(v)) throw new Error("phasesJson must be array");
-        course.phases = v;
-        return true;
-      } catch (e) {
-        alert("Invalid phases JSON: " + e.message);
-        return false;
-      }
+    function redrawCourse() {
+      for (const lyr of zoneLayers.values()) map.removeLayer(lyr);
+      for (const lyr of cpLayers.values()) map.removeLayer(lyr);
+      zoneLayers.clear();
+      cpLayers.clear();
+
+      for (const z of course.zones) upsertZoneLayer(z);
+      for (const cp of course.checkpoints) upsertCheckpointLayer(cp);
+
+      renderZonesList();
+      renderCpsList();
+      renderPhaseSelects();
+      renderPhases();
     }
 
     function renderZonesList() {
       const box = el("zonesList");
       box.innerHTML = "";
       if (course.zones.length === 0) {
-        box.innerHTML = "<div class='muted'>No zones yet.</div>";
+        box.innerHTML = "<div class='muted'>No zones.</div>";
         return;
       }
       for (const z of course.zones) {
@@ -521,7 +528,14 @@ const INDEX_HTML = `<!doctype html>
         const btnDel = document.createElement("button");
         btnDel.textContent = "Delete";
         btnDel.className = "danger";
-        btnDel.onclick = () => deleteZone(z.id);
+        btnDel.onclick = () => {
+          course.zones = course.zones.filter(x => x.id !== z.id);
+          const lyr = zoneLayers.get(z.id);
+          if (lyr) map.removeLayer(lyr);
+          zoneLayers.delete(z.id);
+          renderZonesList();
+          renderPhaseSelects();
+        };
 
         right.appendChild(btnZoom);
         right.appendChild(btnDel);
@@ -534,13 +548,15 @@ const INDEX_HTML = `<!doctype html>
       const box = el("cpsList");
       box.innerHTML = "";
       if (course.checkpoints.length === 0) {
-        box.innerHTML = "<div class='muted'>No checkpoints yet.</div>";
+        box.innerHTML = "<div class='muted'>No checkpoints.</div>";
         return;
       }
       for (const cp of course.checkpoints) {
         const div = document.createElement("div");
         div.className = "li";
-        div.innerHTML = "<div><span class='mono'>" + cp.id + "</span> <span class='muted'>(" + (cp.name||"") + ")</span> <span class='pill'>" + cp.lat.toFixed(5) + "," + cp.lon.toFixed(5) + "</span></div>";
+        div.innerHTML =
+          "<div><span class='mono'>" + cp.id + "</span> <span class='muted'>(" + (cp.name||"") + ")</span> " +
+          "<span class='pill'>" + cp.lat.toFixed(5) + "," + cp.lon.toFixed(5) + "</span></div>";
         const right = document.createElement("div");
         right.style.display = "flex";
         right.style.gap = "6px";
@@ -555,82 +571,117 @@ const INDEX_HTML = `<!doctype html>
         const btnDel = document.createElement("button");
         btnDel.textContent = "Delete";
         btnDel.className = "danger";
-        btnDel.onclick = () => deleteCheckpoint(cp.id);
+        btnDel.onclick = () => {
+          course.checkpoints = course.checkpoints.filter(x => x.id !== cp.id);
+          const lyr = cpLayers.get(cp.id);
+          if (lyr) map.removeLayer(lyr);
+          cpLayers.delete(cp.id);
+          renderCpsList();
+          renderPhaseSelects();
+        };
 
         right.appendChild(btnZoom);
         right.appendChild(btnDel);
         div.appendChild(right);
         box.appendChild(div);
       }
-      renderAnchorSelect();
     }
 
-    function upsertZoneLayer(z) {
-      const b = z.bounds;
-      const bounds = [[b.south, b.west], [b.north, b.east]];
-      let r = zoneLayers.get(z.id);
-      if (!r) {
-        r = L.rectangle(bounds, {weight:2});
-        r.addTo(map);
-        r.bindTooltip(z.id, {permanent:true, direction:"center"});
-        zoneLayers.set(z.id, r);
-      } else {
-        r.setBounds(bounds);
+    function renderPhaseSelects() {
+      const zoneSel = el("phZone");
+      zoneSel.innerHTML = "";
+      for (const z of course.zones) {
+        const opt = document.createElement("option");
+        opt.value = z.id;
+        opt.textContent = z.id + " — " + (z.name||"");
+        zoneSel.appendChild(opt);
+      }
+      if (zoneSel.options.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "(no zones)";
+        zoneSel.appendChild(opt);
+      }
+
+      const cpSel = el("phCP");
+      cpSel.innerHTML = "";
+      for (const c of course.checkpoints) {
+        const opt = document.createElement("option");
+        opt.value = c.id;
+        opt.textContent = c.id + " — " + (c.name||"");
+        cpSel.appendChild(opt);
+      }
+      if (cpSel.options.length === 0) {
+        const opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "(no checkpoints)";
+        cpSel.appendChild(opt);
       }
     }
 
-    function deleteZone(zoneId) {
-      course.zones = course.zones.filter(z => z.id !== zoneId);
-      const lyr = zoneLayers.get(zoneId);
-      if (lyr) { map.removeLayer(lyr); zoneLayers.delete(zoneId); }
-      renderZonesList();
-    }
-
-    function upsertCheckpointLayer(cp) {
-      let m = cpLayers.get(cp.id);
-      if (!m) {
-        m = L.marker([cp.lat, cp.lon]).addTo(map);
-        cpLayers.set(cp.id, m);
-      } else {
-        m.setLatLng([cp.lat, cp.lon]);
+    function renderPhases() {
+      const box = el("phList");
+      box.innerHTML = "";
+      if (course.phases.length === 0) {
+        box.innerHTML = "<div class='muted'>No phases.</div>";
+        return;
       }
-      m.bindTooltip(cp.id, {permanent:true, direction:"top", offset:[0,-12]});
-      m.bindPopup("<b>" + cp.id + "</b><br>" + (cp.name||"") + "<br>" + cp.lat + "," + cp.lon);
+
+      course.phases.forEach((ph, idx) => {
+        const div = document.createElement("div");
+        div.className = "li";
+        div.innerHTML =
+          "<div><span class='mono'>" + (idx+1) + ".</span> " +
+          "<span class='mono'>" + ph.id + "</span> " +
+          "<span class='muted'>(" + (ph.name||"") + ")</span><br>" +
+          "<span class='muted'>enter=" + (ph.enter_zone_id||"-") +
+          " distCP=" + (ph.distance_checkpoint_id||"-") + "</span></div>";
+
+        const right = document.createElement("div");
+        right.style.display = "flex";
+        right.style.gap = "6px";
+
+        const btnUp = document.createElement("button");
+        btnUp.textContent = "↑";
+        btnUp.disabled = idx === 0;
+        btnUp.onclick = () => {
+          const tmp = course.phases[idx-1];
+          course.phases[idx-1] = course.phases[idx];
+          course.phases[idx] = tmp;
+          renderPhases();
+        };
+
+        const btnDown = document.createElement("button");
+        btnDown.textContent = "↓";
+        btnDown.disabled = idx === course.phases.length - 1;
+        btnDown.onclick = () => {
+          const tmp = course.phases[idx+1];
+          course.phases[idx+1] = course.phases[idx];
+          course.phases[idx] = tmp;
+          renderPhases();
+        };
+
+        const btnEdit = document.createElement("button");
+        btnEdit.textContent = "Edit";
+        btnEdit.onclick = () => {
+          el("phId").value = ph.id || "";
+          el("phName").value = ph.name || "";
+          el("phZone").value = ph.enter_zone_id || "";
+          el("phCP").value = ph.distance_checkpoint_id || "";
+        };
+
+        right.appendChild(btnUp);
+        right.appendChild(btnDown);
+        right.appendChild(btnEdit);
+
+        div.appendChild(right);
+        box.appendChild(div);
+      });
     }
 
-    function deleteCheckpoint(cpId) {
-      course.checkpoints = course.checkpoints.filter(c => c.id !== cpId);
-      const lyr = cpLayers.get(cpId);
-      if (lyr) { map.removeLayer(lyr); cpLayers.delete(cpId); }
-      renderCpsList();
-      // also remove anchor references from phases if any (optional)
-      for (const ph of course.phases) {
-        if (ph.ranking_anchor_id === cpId) {
-          ph.ranking_anchor_id = "";
-          ph.ranking_anchor = null;
-        }
-      }
-      renderPhasesJson();
-    }
-
-    function redrawAll() {
-      // clear and redraw zones/checkpoints
-      for (const [id, lyr] of zoneLayers) map.removeLayer(lyr);
-      for (const [id, lyr] of cpLayers) map.removeLayer(lyr);
-      zoneLayers.clear();
-      cpLayers.clear();
-
-      for (const z of course.zones) upsertZoneLayer(z);
-      for (const cp of course.checkpoints) upsertCheckpointLayer(cp);
-
-      renderZonesList();
-      renderCpsList();
-      renderPhasesJson();
-    }
-
-    // --- drawing mode ---
+    // --- modes ---
     let mode = "none"; // none|rect|cp
-    let rectClicks = []; // two LatLngs
+    let rectClicks = [];
 
     function setMode(m) {
       mode = m;
@@ -645,143 +696,91 @@ const INDEX_HTML = `<!doctype html>
       el("btnClearRect").disabled = true;
     }
 
-    function clampBounds(sw, ne) {
-      const south = Math.min(sw.lat, ne.lat);
-      const north = Math.max(sw.lat, ne.lat);
-      const west  = Math.min(sw.lng, ne.lng);
-      const east  = Math.max(sw.lng, ne.lng);
-      return { south, west, north, east };
-    }
+    el("modeNone").onclick = () => { setMode("none"); };
+    el("modeRect").onclick = () => { setMode("rect"); resetRectClicks(); };
+    el("modeCP").onclick = () => { setMode("cp"); };
 
-    function addZoneFromClicks() {
-      if (rectClicks.length !== 2) return;
-      const zId = (el("zoneId").value || "").trim();
-      const zName = (el("zoneName").value || "").trim();
-      if (!zId) { alert("Zone ID required"); return; }
+    el("btnClearRect").onclick = () => { resetRectClicks(); setStatus("rect cancelled"); };
 
-      const existing = course.zones.find(z => z.id === zId);
-      const bounds = clampBounds(rectClicks[0], rectClicks[1]);
-
-      const obj = { id: zId, name: zName, bounds };
-      if (existing) {
-        existing.name = obj.name;
-        existing.bounds = obj.bounds;
-      } else {
-        course.zones.push(obj);
-      }
-
-      upsertZoneLayer(obj);
-      renderZonesList();
-
-      // auto-suggest next zone id/name
-      const ids = new Set(course.zones.map(z => z.id));
-      const nextZ = nextId("Z", ids);
-      el("zoneId").value = nextZ;
-      el("zoneName").value = "Area " + nextZ.replace("Z","");
-
-      resetRectClicks();
-      setStatus("zone added/updated");
-    }
-
-    function addCheckpoint(latlng) {
-      const cpId = (el("cpId").value || "").trim();
-      const cpName = (el("cpName").value || "").trim();
-      if (!cpId) { alert("Checkpoint ID required"); return; }
-
-      const existing = course.checkpoints.find(c => c.id === cpId);
-      const obj = { id: cpId, name: cpName, lat: latlng.lat, lon: latlng.lng };
-
-      if (existing) {
-        existing.name = obj.name;
-        existing.lat = obj.lat;
-        existing.lon = obj.lon;
-      } else {
-        course.checkpoints.push(obj);
-      }
-
-      upsertCheckpointLayer(obj);
-      renderCpsList();
-
-      // auto-suggest next cp id
-      const ids = new Set(course.checkpoints.map(c => c.id));
-      const nextC = nextId("C", ids);
-      el("cpId").value = nextC;
-      el("cpName").value = "CP " + nextC;
-
-      setStatus("checkpoint added/updated");
-    }
-
-    // map click handler
     map.on("click", (e) => {
       if (mode === "rect") {
         rectClicks.push(e.latlng);
         el("rectClicks").textContent = String(rectClicks.length);
         el("btnClearRect").disabled = false;
-
         if (rectClicks.length === 2) {
-          addZoneFromClicks();
+          const zId = (el("zoneId").value || "").trim();
+          const zName = (el("zoneName").value || "").trim();
+          if (!zId) { alert("Zone ID required"); resetRectClicks(); return; }
+
+          const bounds = clampBounds(rectClicks[0], rectClicks[1]);
+          const existing = course.zones.find(z => z.id === zId);
+          const obj = { id: zId, name: zName, bounds };
+
+          if (existing) Object.assign(existing, obj);
+          else course.zones.push(obj);
+
+          upsertZoneLayer(obj);
+          renderZonesList();
+          renderPhaseSelects();
+
+          // auto next
+          const nextZ = nextZoneId();
+          el("zoneId").value = nextZ;
+          el("zoneName").value = "Area " + nextZ.replace("Z","");
+          resetRectClicks();
+          setStatus("zone saved (local)");
         }
         return;
       }
 
       if (mode === "cp") {
-        addCheckpoint(e.latlng);
+        const cpId = (el("cpId").value || "").trim();
+        const cpName = (el("cpName").value || "").trim();
+        if (!cpId) { alert("Checkpoint ID required"); return; }
+
+        const obj = { id: cpId, name: cpName, lat: e.latlng.lat, lon: e.latlng.lng };
+        const existing = course.checkpoints.find(c => c.id === cpId);
+        if (existing) Object.assign(existing, obj);
+        else course.checkpoints.push(obj);
+
+        upsertCheckpointLayer(obj);
+        renderCpsList();
+        renderPhaseSelects();
+
+        const nextC = nextCheckpointId();
+        el("cpId").value = nextC;
+        el("cpName").value = "CP " + nextC;
+        setStatus("checkpoint saved (local)");
         return;
       }
     });
 
-    // buttons
-    el("modeNone").onclick = () => setMode("none");
-    el("modeRect").onclick = () => { setMode("rect"); resetRectClicks(); };
-    el("modeCP").onclick = () => setMode("cp");
-    el("btnClearRect").onclick = () => { resetRectClicks(); setStatus("rect cancelled"); };
-
-    // phases tool
-    el("btnAddPhase").onclick = () => {
-      // allow manual edit in textarea to override
-      if (!loadPhasesJsonFromTextarea()) return;
-
+    // phases upsert/delete
+    el("btnUpsertPhase").onclick = () => {
       const id = (el("phId").value || "").trim();
       const name = (el("phName").value || "").trim();
-      const anchorId = (el("phAnchor").value || "").trim();
-      const seqRaw = (el("phSeq").value || "").trim();
+      const enterZone = (el("phZone").value || "").trim();
+      const distCP = (el("phCP").value || "").trim();
 
       if (!id) { alert("Phase ID required"); return; }
-      if (!seqRaw) { alert("Phase zone sequence required"); return; }
+      if (!enterZone) { alert("Enter Zone required"); return; }
+      if (!distCP) { alert("Distance CP required"); return; }
 
-      const expected_sequence = seqRaw.split(",").map(s => s.trim()).filter(Boolean);
-
-      let ranking_anchor = null;
-      let ranking_anchor_id = anchorId || "";
-      if (anchorId) {
-        const cp = course.checkpoints.find(c => c.id === anchorId);
-        if (cp) ranking_anchor = { lat: cp.lat, lon: cp.lon };
-      }
-
-      const ph = {
-        id, name,
-        expected_sequence,
-        ranking_anchor_id,
-        ranking_anchor
-      };
-
+      const ph = { id, name, enter_zone_id: enterZone, distance_checkpoint_id: distCP };
       const existing = course.phases.find(p => p.id === id);
-      if (existing) {
-        Object.assign(existing, ph);
-      } else {
-        course.phases.push(ph);
-      }
-      renderPhasesJson();
-      setStatus("phase added/updated");
+      if (existing) Object.assign(existing, ph);
+      else course.phases.push(ph);
+
+      renderPhases();
+      setStatus("phase saved (local)");
     };
 
     el("btnDelPhase").onclick = () => {
-      if (!loadPhasesJsonFromTextarea()) return;
       const id = (el("phId").value || "").trim();
       if (!id) { alert("Phase ID required"); return; }
       course.phases = course.phases.filter(p => p.id !== id);
-      renderPhasesJson();
-      setStatus("phase deleted");
+      renderPhases();
+      setStatus("phase deleted (local)");
     };
 
     // load/save course
@@ -791,23 +790,12 @@ const INDEX_HTML = `<!doctype html>
         const r = await fetch(API + "/course");
         if (!r.ok) throw new Error("HTTP " + r.status);
         const d = await r.json();
-        // merge to our schema
         course.version = 1;
         course.zones = Array.isArray(d.zones) ? d.zones : [];
         course.checkpoints = Array.isArray(d.checkpoints) ? d.checkpoints : [];
         course.phases = Array.isArray(d.phases) ? d.phases : [];
         course.activeWithinSec = (typeof d.activeWithinSec === "number") ? d.activeWithinSec : 60;
-
-        // Recompute phase anchors (in case saved as anchor_id only)
-        for (const ph of course.phases) {
-          if (ph.ranking_anchor_id && (!ph.ranking_anchor || typeof ph.ranking_anchor.lat !== "number")) {
-            const cp = course.checkpoints.find(c => c.id === ph.ranking_anchor_id);
-            if (cp) ph.ranking_anchor = { lat: cp.lat, lon: cp.lon };
-          }
-        }
-
-        redrawAll();
-        renderAnchorSelect();
+        redrawCourse();
         setStatus("loaded");
       } catch (e) {
         setStatus("load error");
@@ -816,17 +804,6 @@ const INDEX_HTML = `<!doctype html>
     };
 
     el("btnSave").onclick = async () => {
-      // phases from textarea is authoritative
-      if (!loadPhasesJsonFromTextarea()) return;
-
-      // ensure phase anchor coords exist
-      for (const ph of course.phases) {
-        if (ph.ranking_anchor_id) {
-          const cp = course.checkpoints.find(c => c.id === ph.ranking_anchor_id);
-          if (cp) ph.ranking_anchor = { lat: cp.lat, lon: cp.lon };
-        }
-      }
-
       try {
         setStatus("saving...");
         const r = await fetch(API + "/course", {
@@ -842,17 +819,71 @@ const INDEX_HTML = `<!doctype html>
       }
     };
 
-    // --- scoreboard polling ---
+    // --- hidden devices ---
+    async function loadHidden() {
+      try {
+        const r = await fetch(API + "/hidden_devices");
+        if (!r.ok) return;
+        const d = await r.json();
+        const arr = Array.isArray(d.hidden) ? d.hidden : [];
+        hiddenSet = new Set(arr);
+        el("hiddenCount").textContent = String(arr.length);
+        renderHiddenList(arr);
+      } catch {}
+    }
+
+    async function setHidden(deviceId, hidden) {
+      try {
+        const r = await fetch(API + "/hidden_devices", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ device_id: deviceId, hidden }),
+        });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        await loadHidden();
+      } catch (e) {
+        alert("Hide/unhide failed: " + e.message);
+      }
+    }
+
+    function renderHiddenList(arr) {
+      const box = el("hiddenList");
+      box.innerHTML = "";
+      if (arr.length === 0) {
+        box.innerHTML = "<div class='muted'>No hidden devices.</div>";
+        return;
+      }
+      arr.forEach((id) => {
+        const div = document.createElement("div");
+        div.className = "li";
+        div.innerHTML = "<div class='mono'>" + id + "</div>";
+        const btn = document.createElement("button");
+        btn.textContent = "Unhide";
+        btn.onclick = () => setHidden(id, false);
+        div.appendChild(btn);
+        box.appendChild(div);
+      });
+    }
+
+    // --- scoreboard ---
     function upsertRacerMarker(device_id, lat, lon, label) {
-      let m = markers.get(device_id);
+      let m = racerMarkers.get(device_id);
       const ll = [lat, lon];
       if (!m) {
         m = L.marker(ll).addTo(map).bindPopup(device_id);
-        markers.set(device_id, m);
+        racerMarkers.set(device_id, m);
       } else {
         m.setLatLng(ll);
       }
-      if (label) m.bindTooltip(label, {permanent:true, direction:"top", offset:[0,-12]});
+      m.bindTooltip(label, {permanent:true, direction:"top", offset:[0,-12]});
+    }
+
+    function removeRacerMarker(device_id) {
+      const m = racerMarkers.get(device_id);
+      if (m) {
+        map.removeLayer(m);
+        racerMarkers.delete(device_id);
+      }
     }
 
     function renderScore(items, activeCount) {
@@ -862,19 +893,36 @@ const INDEX_HTML = `<!doctype html>
       const box = el("scoreList");
       box.innerHTML = "";
       if (items.length === 0) {
-        box.innerHTML = "<div class='muted'>No devices yet.</div>";
+        box.innerHTML = "<div class='muted'>No visible devices.</div>";
         return;
       }
+
       items.forEach((it, idx) => {
         const div = document.createElement("div");
-        div.className = "scoreItem";
-        const dist = it.progress && it.progress.distM != null ? (it.progress.distM.toFixed(0) + " m") : "-";
+        div.className = "li";
+
+        const dist = (it.progress && it.progress.distM != null) ? (it.progress.distM.toFixed(0) + " m") : "-";
         const act = it.progress && it.progress.isActive ? "ACTIVE" : "offline";
         const ph = it.progress ? it.progress.phaseIndex : 0;
-        const st = it.progress ? it.progress.seqIndex : -1;
+        const started = it.progress ? (it.progress.phaseStarted ? "started" : "not-started") : "n/a";
+
         div.innerHTML =
-          "<div class='mono'>#" + (idx+1) + " " + it.device_id + "</div>" +
-          "<div class='muted'>phase=" + ph + " step=" + st + " dist=" + dist + " " + act + "</div>";
+          "<div>" +
+            "<div class='mono'>#" + (idx+1) + " " + it.device_id + "</div>" +
+            "<div class='muted'>phase=" + ph + " (" + started + ") dist=" + dist + " " + act + "</div>" +
+          "</div>";
+
+        const right = document.createElement("div");
+        right.style.display = "flex";
+        right.style.gap = "6px";
+
+        const btnHide = document.createElement("button");
+        btnHide.textContent = "Hide";
+        btnHide.className = "danger";
+        btnHide.onclick = () => setHidden(it.device_id, true);
+
+        right.appendChild(btnHide);
+        div.appendChild(right);
         box.appendChild(div);
 
         if (it.latest && typeof it.latest.lat === "number" && typeof it.latest.lon === "number") {
@@ -888,7 +936,13 @@ const INDEX_HTML = `<!doctype html>
         const r = await fetch(API + "/scoreboard");
         if (!r.ok) return;
         const d = await r.json();
-        renderScore(d.items || [], d.active_count);
+        const items = Array.isArray(d.items) ? d.items : [];
+        const active = d.active_count ?? 0;
+
+        // remove markers of hidden devices (if any remained)
+        for (const id of hiddenSet) removeRacerMarker(id);
+
+        renderScore(items, active);
       } catch {}
     }
 
@@ -897,14 +951,16 @@ const INDEX_HTML = `<!doctype html>
     resetRectClicks();
     renderZonesList();
     renderCpsList();
-    renderAnchorSelect();
-    renderPhasesJson();
+    renderPhaseSelects();
+    renderPhases();
+    loadHidden();
     tickScore();
     setInterval(tickScore, 1000);
   </script>
 </body>
 </html>`;
 
+// ---------------------- Worker fetch ----------------------
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -917,7 +973,7 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
 
-    // --- UI ---
+    // UI
     if (request.method === "GET" && url.pathname === "/") {
       return new Response(INDEX_HTML, {
         status: 200,
@@ -925,12 +981,38 @@ export default {
       });
     }
 
-    // --- health ---
+    // Health
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, server_time_ms: nowMs() });
     }
 
-    // --- course management ---
+    // Hidden devices
+    if (url.pathname === "/hidden_devices") {
+      if (request.method === "GET") {
+        const hidden = await getHiddenDevices(env);
+        return json({ ok: true, hidden });
+      }
+      if (request.method === "POST") {
+        let body;
+        try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+
+        const device_id = String(body.device_id || "").trim();
+        const hidden = !!body.hidden;
+        if (!device_id) return json({ ok: false, error: "device_id required" }, 400);
+
+        const arr = await getHiddenDevices(env);
+        const set = new Set(arr);
+        if (hidden) set.add(device_id);
+        else set.delete(device_id);
+
+        const out = Array.from(set);
+        await setHiddenDevices(env, out);
+        return json({ ok: true, hidden: out });
+      }
+      return json({ ok: false, error: "Method not allowed" }, 405);
+    }
+
+    // Course management
     if (url.pathname === "/course") {
       if (request.method === "GET") {
         const course = await getCourse(env);
@@ -938,26 +1020,45 @@ export default {
       }
       if (request.method === "POST") {
         let body;
-        try {
-          body = await request.json();
-        } catch {
-          return json({ ok: false, error: "Invalid JSON" }, 400);
-        }
+        try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
 
-        // enforce rectangles only (reject circle types etc.)
         body.version = 1;
         body.zones = Array.isArray(body.zones) ? body.zones : [];
+        body.checkpoints = Array.isArray(body.checkpoints) ? body.checkpoints : [];
         body.phases = Array.isArray(body.phases) ? body.phases : [];
         if (typeof body.activeWithinSec !== "number") body.activeWithinSec = 60;
 
+        // Validate zones: rectangles only
         for (const z of body.zones) {
-          if (!z || typeof z !== "object") return json({ ok:false, error:"Invalid zone object" }, 400);
-          if (!z.bounds || typeof z.bounds !== "object") return json({ ok:false, error:"Zone bounds required" }, 400);
-          // bounds must be numbers
+          if (!z || typeof z !== "object") return json({ ok: false, error: "Invalid zone object" }, 400);
+          if (!z.id || typeof z.id !== "string") return json({ ok: false, error: "Zone id required" }, 400);
+          if (!z.bounds || typeof z.bounds !== "object") return json({ ok: false, error: "Zone bounds required" }, 400);
           const b = z.bounds;
-          if ([b.south,b.west,b.north,b.east].some((x)=>typeof x !== "number")) {
-            return json({ ok:false, error:"Zone bounds must be numbers (south,west,north,east)" }, 400);
+          if ([b.south, b.west, b.north, b.east].some((x) => typeof x !== "number")) {
+            return json({ ok: false, error: "Zone bounds must be numbers (south,west,north,east)" }, 400);
           }
+        }
+
+        // Validate checkpoints
+        for (const c of body.checkpoints) {
+          if (!c || typeof c !== "object") return json({ ok: false, error: "Invalid checkpoint object" }, 400);
+          if (!c.id || typeof c.id !== "string") return json({ ok: false, error: "Checkpoint id required" }, 400);
+          if (typeof c.lat !== "number" || typeof c.lon !== "number") {
+            return json({ ok: false, error: "Checkpoint lat/lon must be numbers" }, 400);
+          }
+        }
+
+        const zoneIds = new Set(body.zones.map((z) => z.id));
+        const cpIds = new Set(body.checkpoints.map((c) => c.id));
+
+        // Validate phases
+        for (const p of body.phases) {
+          if (!p || typeof p !== "object") return json({ ok: false, error: "Invalid phase object" }, 400);
+          if (!p.id || typeof p.id !== "string") return json({ ok: false, error: "Phase id required" }, 400);
+          if (!p.enter_zone_id || typeof p.enter_zone_id !== "string") return json({ ok: false, error: "Phase enter_zone_id required" }, 400);
+          if (!p.distance_checkpoint_id || typeof p.distance_checkpoint_id !== "string") return json({ ok: false, error: "Phase distance_checkpoint_id required" }, 400);
+          if (!zoneIds.has(p.enter_zone_id)) return json({ ok: false, error: "Phase enter_zone_id not found in zones: " + p.enter_zone_id }, 400);
+          if (!cpIds.has(p.distance_checkpoint_id)) return json({ ok: false, error: "Phase distance_checkpoint_id not found in checkpoints: " + p.distance_checkpoint_id }, 400);
         }
 
         await saveCourse(env, body);
@@ -966,14 +1067,10 @@ export default {
       return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
-    // --- ingest (simple JSON) ---
+    // Ingest (JSON)
     if (request.method === "POST" && url.pathname === "/ingest") {
       let body;
-      try {
-        body = await request.json();
-      } catch {
-        return json({ ok: false, error: "Invalid JSON" }, 400);
-      }
+      try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
 
       const device_id = String(body.device_id || "").trim();
       const lat = Number(body.lat);
@@ -993,14 +1090,13 @@ export default {
 
       await saveLatestAndRegisterDevice(env, entry);
 
-      // update race state
       const course = await getCourse(env);
       await updateRaceState(env, course, device_id, lat, lon, entry.received_at_ms);
 
       return json({ ok: true });
     }
 
-    // --- traccar adapter (GET/POST) ---
+    // Traccar adapter (GET/POST)
     if (url.pathname === "/traccar") {
       if (request.method === "GET") {
         const device_id = String(url.searchParams.get("device_id") || url.searchParams.get("id") || "").trim();
@@ -1031,18 +1127,13 @@ export default {
         if (!device_id) return text("ERR: device_id (or id) required", 400);
 
         let body;
-        try {
-          body = await request.json();
-        } catch {
-          return text("ERR: invalid JSON", 400);
-        }
+        try { body = await request.json(); } catch { return text("ERR: invalid JSON", 400); }
 
         const p = body && body.location ? body.location : body;
         const c = p && p.coords ? p.coords : p;
 
         const lat = Number(c?.latitude ?? c?.lat);
         const lon = Number(c?.longitude ?? c?.lon);
-
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) return text("ERR: lat/lon required", 400);
 
         let t_ms = nowMs();
@@ -1066,40 +1157,41 @@ export default {
       return text("Method not allowed", 405);
     }
 
-    // --- latest endpoints (unchanged style) ---
+    // latest_all (optionally filtered by hidden)
     if (request.method === "GET" && url.pathname === "/latest_all") {
+      const hidden = new Set(await getHiddenDevices(env));
+
       const devicesRaw = await env.GPS_KV.get(KV_DEVICES_KEY);
       const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
       const items = [];
       for (const id of devices) {
+        if (hidden.has(id)) continue;
         const raw = await env.GPS_KV.get(KV_LATEST_PREFIX + id);
         if (!raw) continue;
-        try {
-          items.push(JSON.parse(raw));
-        } catch {}
+        try { items.push(JSON.parse(raw)); } catch {}
       }
       return json({ server_time_ms: nowMs(), items });
     }
 
+    // latest (single)
     if (request.method === "GET" && url.pathname === "/latest") {
       const device_id = String(url.searchParams.get("device_id") || "").trim();
       if (!device_id) return json({ ok: false, error: "device_id required" }, 400);
 
       const raw = await env.GPS_KV.get(KV_LATEST_PREFIX + device_id);
-      if (!raw) {
-        return json({ device_id, lat: null, lon: null, t_ms: null, received_at_ms: null });
-      }
-      try {
-        return json(JSON.parse(raw));
-      } catch {
-        return json({ ok: false, error: "Corrupt data" }, 500);
-      }
+      if (!raw) return json({ device_id, lat: null, lon: null, t_ms: null, received_at_ms: null });
+
+      try { return json(JSON.parse(raw)); }
+      catch { return json({ ok: false, error: "Corrupt data" }, 500); }
     }
 
-    // --- scoreboard ---
+    // Scoreboard
     if (request.method === "GET" && url.pathname === "/scoreboard") {
       const course = await getCourse(env);
       const serverTimeMs = nowMs();
+
+      const hidden = await getHiddenDevices(env);
+      const hiddenSet = new Set(hidden);
 
       const devicesRaw = await env.GPS_KV.get(KV_DEVICES_KEY);
       const devices = devicesRaw ? safeJsonParseArray(devicesRaw) : [];
@@ -1107,21 +1199,21 @@ export default {
       const out = [];
 
       for (const id of devices) {
-        // latest
+        if (hiddenSet.has(id)) continue;
+
         let latest = null;
         const latestRaw = await env.GPS_KV.get(KV_LATEST_PREFIX + id);
         if (latestRaw) {
           try { latest = JSON.parse(latestRaw); } catch {}
         }
 
-        // state
         let state = null;
         const stateRaw = await env.GPS_KV.get(KV_STATE_PREFIX + id);
         if (stateRaw) {
           try { state = JSON.parse(stateRaw); } catch {}
         }
 
-        // If state missing but latest exists, initialize/update once (so scoreboard works immediately)
+        // If state missing but latest exists, initialize/update once
         if (!state && latest && typeof latest.lat === "number" && typeof latest.lon === "number") {
           const u = await updateRaceState(env, course, id, latest.lat, latest.lon, latest.received_at_ms ?? serverTimeMs);
           state = u.state;
