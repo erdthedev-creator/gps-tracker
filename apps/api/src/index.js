@@ -1279,12 +1279,13 @@ export default {
     // ingest: accepts your format
     if (request.method === "POST" && url.pathname === "/ingest") {
       let body;
-      try { body = await request.json(); }
-      catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+      try {
+        body = await request.json();
+      } catch {
+        return json({ ok: false, error: "Invalid JSON" }, 400);
+      }
 
-      // Accept:
-      // 1) {id, lat, lon, alt, acc, spd, time}
-      // 2) {device_id, lat, lon, t_ms}
+      // Android → Worker field mapping
       const device_id = String(body.device_id ?? body.id ?? "").trim();
       const lat = Number(body.lat);
       const lon = Number(body.lon);
@@ -1292,24 +1293,23 @@ export default {
       const t_ms =
         body.t_ms != null ? Number(body.t_ms) :
         body.time != null ? Number(body.time) :
-        nowMs();
+        Date.now();
 
-      if (!device_id) return json({ ok: false, error: "device_id/id required" }, 400);
-      if (!Number.isFinite(lat) || !Number.isFinite(lon)) return json({ ok: false, error: "lat/lon required" }, 400);
+      if (!device_id)
+        return json({ ok: false, error: "device_id/id required" }, 400);
 
-      const alt = asNumberOrNull(body.alt);
-      const acc = asNumberOrNull(body.acc);
-      const spd = asNumberOrNull(body.spd);
+      if (!Number.isFinite(lat) || !Number.isFinite(lon))
+        return json({ ok: false, error: "lat/lon required" }, 400);
 
       const entry = {
         device_id,
-        t_ms: Number.isFinite(t_ms) ? t_ms : nowMs(),
         lat,
         lon,
-        received_at_ms: nowMs(),
-        ...(alt != null ? { alt } : {}),
-        ...(acc != null ? { acc } : {}),
-        ...(spd != null ? { spd } : {}),
+        t_ms,
+        alt: body.alt ?? null,
+        acc: body.acc ?? null,
+        spd: body.spd ?? null,
+        received_at_ms: Date.now()
       };
 
       await saveLatestAndRegisterDevice(env, entry);
