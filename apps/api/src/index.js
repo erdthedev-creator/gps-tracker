@@ -1381,6 +1381,44 @@ export default {
       return text("Method not allowed", 405);
     }
 
+
+        // per-device latest JSON (canonical shape)
+    // GET /device_id=1
+    // (optional) GET /device?device_id=1  or /device?id=1
+    {
+      const path = url.pathname.replace(/\/+$/, ""); // tolerate trailing slash
+
+      if (request.method === "GET" && (path.startsWith("/device_id=") || path === "/device")) {
+        const device_id =
+          path.startsWith("/device_id=")
+            ? decodeURIComponent(path.slice("/device_id=".length)).trim()
+            : String(url.searchParams.get("device_id") || url.searchParams.get("id") || "").trim();
+
+        if (!device_id) return json({ ok: false, error: "device_id required" }, 400);
+
+        const raw = await env.GPS_KV.get(KV_LATEST_PREFIX + device_id);
+        if (!raw) return json({ ok: false, error: "device not found" }, 404);
+
+        let latest;
+        try { latest = JSON.parse(raw); } catch { return json({ ok: false, error: "corrupt latest JSON" }, 500); }
+
+        // ensure canonical keys exist (alt/acc/spd included)
+        const out = {
+          device_id: String(latest.device_id ?? device_id),
+          lat: Number(latest.lat),
+          lon: Number(latest.lon),
+          t_ms: Number(latest.t_ms ?? latest.time ?? Date.now()),
+          alt: latest.alt ?? null,
+          acc: latest.acc ?? null,
+          spd: latest.spd ?? null,
+          // extra (haritadan bağımsız faydalı): en son ne zaman Worker'a geldi
+          received_at_ms: latest.received_at_ms ?? null,
+        };
+
+        return json(out);
+      }
+    }
+    
     // latest_all (excluding hidden)
     if (request.method === "GET" && url.pathname === "/latest_all") {
       const hidden = new Set(await getHiddenDevices(env));
