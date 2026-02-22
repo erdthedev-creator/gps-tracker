@@ -6,16 +6,24 @@
  * - Phase-based progress (strict order, no skipping; phaseStarted required to advance)
  * - Scoreboard
  * - Hide/Unhide devices (removes from map + scoreboard)
+ * - Multiple layouts (save/load by name) + active layout selection
  */
 
 const MAINTENANCE_MODE = false;
 
 // KV keys
-const KV_COURSE_KEY = "course:active";
 const KV_DEVICES_KEY = "devices";
 const KV_LATEST_PREFIX = "latest:";
 const KV_STATE_PREFIX = "race_state:";
 const KV_HIDDEN_DEVICES_KEY = "hidden:devices";
+
+// Backward compatible "active course content"
+const KV_COURSE_KEY = "course:active";
+
+// Multi-layout support
+const KV_COURSE_INDEX_KEY = "courses:index"; // ["default","layout1",...]
+const KV_COURSE_PREFIX = "course:";          // course:<name> (named layouts)
+const KV_ACTIVE_COURSE_NAME_KEY = "course:active_name"; // "default" | "layout1" ...
 
 // ---------------------- Helpers ----------------------
 function corsHeaders() {
@@ -74,34 +82,62 @@ function pointInRect(lat, lon, bounds) {
   return lat >= south && lat <= north && lon >= west && lon <= east;
 }
 
-// ---------------------- Course / Hidden ----------------------
+// ---------------------- Course / Multi Layout ----------------------
+function defaultCourseTemplate(name = "default") {
+  return {
+    version: 1,
+    name,
+    zones: [],        // [{id,name,bounds:{south,west,north,east}}]
+    checkpoints: [],  // [{id,name,lat,lon}]
+    phases: [],       // ordered list: [{id,name,enter_zone_id,distance_checkpoint_id}]
+    activeWithinSec: 60,
+  };
+}
+
+function normalizeCourseName(name) {
+  const n = String(name || "").trim();
+  if (!n) return "default";
+  // allow: a-zA-Z0-9_- (spaces -> _), max 48 chars
+  return n.replace(/\s+/g, "_").replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 48) || "default";
+}
+
+async function listCourses(env) {
+  const raw = await env.GPS_KV.get(KV_COURSE_INDEX_KEY);
+  const arr = raw ? safeJsonParseArray(raw) : [];
+  const set = new Set(arr);
+  set.add("default");
+  const out = Array.from(set);
+  out.sort();
+  await env.GPS_KV.put(KV_COURSE_INDEX_KEY, JSON.stringify(out));
+  return out;
+}
+
+async function upsertCourseIndex(env, courseName) {
+  const name = normalizeCourseName(courseName);
+  const arr = await listCourses(env);
+  if (!arr.includes(name)) {
+    arr.push(name);
+    arr.sort();
+    await env.GPS_KV.put(KV_COURSE_INDEX_KEY, JSON.stringify(arr));
+  }
+  return name;
+}
+
+// Backward compatible "active course content" getter
 async function getCourse(env) {
   const raw = await env.GPS_KV.get(KV_COURSE_KEY);
-  if (!raw) {
-    return {
-      version: 1,
-      zones: [],        // [{id,name,bounds:{south,west,north,east}}]
-      checkpoints: [],  // [{id,name,lat,lon}]
-      phases: [],       // ordered list: [{id,name,enter_zone_id,distance_checkpoint_id}]
-      activeWithinSec: 60,
-    };
-  }
+  if (!raw) return defaultCourseTemplate("default");
   try {
     const v = JSON.parse(raw);
     v.version = 1;
+    v.name = v.name || "default";
     v.zones = Array.isArray(v.zones) ? v.zones : [];
     v.checkpoints = Array.isArray(v.checkpoints) ? v.checkpoints : [];
     v.phases = Array.isArray(v.phases) ? v.phases : [];
     if (typeof v.activeWithinSec !== "number") v.activeWithinSec = 60;
     return v;
   } catch {
-    return {
-      version: 1,
-      zones: [],
-      checkpoints: [],
-      phases: [],
-      activeWithinSec: 60,
-    };
+    return defaultCourseTemplate("default");
   }
 }
 
@@ -109,6 +145,64 @@ async function saveCourse(env, courseObj) {
   await env.GPS_KV.put(KV_COURSE_KEY, JSON.stringify(courseObj));
 }
 
+// Named layout getter
+async function getCourseByName(env, courseName) {
+  const name = normalizeCourseName(courseName);
+  if (name === "default") {
+    const c = await getCourse(env);
+    c.name = "default";
+    return c;
+  }
+  const raw = await env.GPS_KV.get(KV_COURSE_PREFIX + name);
+  if (!raw) return defaultCourseTemplate(name);
+  try {
+    const v = JSON.parse(raw);
+    v.version = 1;
+    v.name = name;
+    v.zones = Array.isArray(v.zones) ? v.zones : [];
+    v.checkpoints = Array.isArray(v.checkpoints) ? v.checkpoints : [];
+    v.phases = Array.isArray(v.phases) ? v.phases : [];
+    if (typeof v.activeWithinSec !== "number") v.activeWithinSec = 60;
+    return v;
+  } catch {
+    return defaultCourseTemplate(name);
+  }
+}
+
+// Named layout save
+async function saveCourseByName(env, courseName, courseObj) {
+  const name = normalizeCourseName(courseName);
+  courseObj.name = name;
+  courseObj.version = 1;
+
+  if (name === "default") {
+    await saveCourse(env, courseObj);
+  } else {
+    await env.GPS_KV.put(KV_COURSE_PREFIX + name, JSON.stringify(courseObj));
+  }
+  await upsertCourseIndex(env, name);
+  return name;
+}
+
+// Active layout selection
+async function getActiveCourseName(env) {
+  const raw = await env.GPS_KV.get(KV_ACTIVE_COURSE_NAME_KEY);
+  return normalizeCourseName(raw || "default");
+}
+
+async function setActiveCourseName(env, name) {
+  const n = normalizeCourseName(name);
+  await env.GPS_KV.put(KV_ACTIVE_COURSE_NAME_KEY, n);
+  await upsertCourseIndex(env, n);
+  return n;
+}
+
+async function getActiveCourse(env) {
+  const name = await getActiveCourseName(env);
+  return await getCourseByName(env, name);
+}
+
+// ---------------------- Hidden Devices ----------------------
 async function getHiddenDevices(env) {
   const raw = await env.GPS_KV.get(KV_HIDDEN_DEVICES_KEY);
   return raw ? safeJsonParseArray(raw) : [];
@@ -147,7 +241,7 @@ function detectZoneId(course, lat, lon) {
  * Strict rules:
  * - Phase k starts ONLY when entering phases[k].enter_zone_id
  * - Advance ONLY to phase k+1 by entering phases[k+1].enter_zone_id
- * - And ONLY if current phase is started (phaseStarted=true). (No skipping, no "free advance")
+ * - And ONLY if current phase has started (phaseStarted=true). (No skipping, no "free advance")
  */
 async function updateRaceState(env, course, deviceId, lat, lon, receivedAtMs) {
   const key = KV_STATE_PREFIX + deviceId;
@@ -192,8 +286,6 @@ async function updateRaceState(env, course, deviceId, lat, lon, receivedAtMs) {
       state.phaseIndex += 1;
       state.phaseStarted = true; // because we entered next phase's start zone
     }
-
-    // Any later phase zone enters are ignored (no skipping) because we only check "next"
   }
 
   state.lastZoneId = zoneIdNow;
@@ -258,7 +350,7 @@ const INDEX_HTML = `<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>GPS Tracker • Course Tool + Scoreboard</title>
+  <title>GPS Tracker • Layout Tool + Scoreboard</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <style>
@@ -271,7 +363,7 @@ const INDEX_HTML = `<!doctype html>
       padding: 10px; border-radius: 12px;
       font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
       box-shadow: 0 6px 18px rgba(0,0,0,0.18);
-      width: 380px; max-height: calc(100vh - 20px); overflow:auto;
+      width: 410px; max-height: calc(100vh - 20px); overflow:auto;
     }
     .panel h3{ margin: 0 0 8px 0; font-size: 14px; }
     .row{ display:flex; gap:8px; align-items:center; margin: 6px 0; }
@@ -297,106 +389,143 @@ const INDEX_HTML = `<!doctype html>
     .pill{ font-size:11px; background:#f6f6f6; border:1px solid #eee; padding:2px 6px; border-radius:999px; }
     .hint{ font-size:11px; color:#555; line-height:1.25; }
     .two{ display:grid; grid-template-columns: 1fr 1fr; gap:8px; }
+
+    /* checkpoint badge (no pin) */
+    .cp-badge{
+      width:28px; height:28px;
+      border-radius:999px;
+      border:2px solid #111;
+      background:#fff;
+      display:flex; align-items:center; justify-content:center;
+      font-weight:700;
+      font-size:12px;
+      line-height:1;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.25);
+      user-select:none;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
 
   <div class="panel">
-    <h3>Course Tool</h3>
-
-    <div class="row">
-      <button id="btnLoad" class="primary">Load</button>
-      <button id="btnSave" class="primary">Save</button>
-      <span id="status" class="mono muted">idle</span>
+    <div class="row" style="justify-content:space-between">
+      <h3 style="margin:0">Course Tool</h3>
+      <button id="btnToggleCourse" class="primary">Hide</button>
     </div>
 
-    <div class="row">
-      <button id="modeNone">Mode: View ✓</button>
-      <button id="modeRect">Draw Rectangle</button>
-      <button id="modeCP">Add Checkpoint</button>
-    </div>
-    <div class="hint">
-      Rectangle: click SW corner, then click NE corner. (No circles.)<br>
-      Checkpoint: click anywhere to drop a point.
-    </div>
-
-    <div class="sep"></div>
-
-    <div class="two">
-      <div>
-        <label class="muted">New Zone ID</label>
-        <input id="zoneId" type="text" value="Z1" />
+    <div id="courseBody">
+      <div class="two">
+        <div>
+          <label class="muted">Layout Name</label>
+          <input id="layoutName" type="text" value="default" />
+        </div>
+        <div>
+          <label class="muted">Layouts</label>
+          <select id="layoutSelect"></select>
+        </div>
       </div>
-      <div>
-        <label class="muted">New Zone Name</label>
-        <input id="zoneName" type="text" value="Area 1" />
+
+      <div class="row">
+        <button id="btnLoad" class="primary">Load</button>
+        <button id="btnSave" class="primary">Save</button>
+        <button id="btnRefreshLayouts">Refresh</button>
+        <span id="status" class="mono muted">idle</span>
       </div>
-    </div>
 
-    <div class="row">
-      <button id="btnClearRect" class="danger" disabled>Cancel Rectangle</button>
-      <span class="muted">Clicks: <span id="rectClicks">0</span>/2</span>
-    </div>
-
-    <label class="muted">Zones</label>
-    <div id="zonesList" class="list"></div>
-
-    <div class="sep"></div>
-
-    <div class="two">
-      <div>
-        <label class="muted">New CP ID</label>
-        <input id="cpId" type="text" value="A" />
+      <div class="hint">
+        Loaded/saved layout becomes ACTIVE (scoreboard uses it).
       </div>
-      <div>
-        <label class="muted">New CP Name</label>
-        <input id="cpName" type="text" value="Start" />
+
+      <div class="sep"></div>
+
+      <div class="row">
+        <button id="modeNone">Mode: View ✓</button>
+        <button id="modeRect">Draw Rectangle</button>
+        <button id="modeCP">Add Checkpoint</button>
       </div>
-    </div>
-
-    <label class="muted">Checkpoints</label>
-    <div id="cpsList" class="list"></div>
-
-    <div class="sep"></div>
-
-    <h3>Phases (Ordered)</h3>
-    <div class="hint">
-      Strict order: phase can start only by entering its zone. You can only advance to the NEXT phase
-      by entering the NEXT phase zone, and only if current phase has started.
-    </div>
-
-    <div class="two">
-      <div>
-        <label class="muted">Phase ID</label>
-        <input id="phId" type="text" value="p1" />
+      <div class="hint">
+        Rectangle: click SW corner, then click NE corner. (No circles.)<br>
+        Checkpoint: click anywhere to drop a point.
       </div>
-      <div>
-        <label class="muted">Phase Name</label>
-        <input id="phName" type="text" value="Stage 1" />
+
+      <div class="sep"></div>
+
+      <div class="two">
+        <div>
+          <label class="muted">New Zone ID</label>
+          <input id="zoneId" type="text" value="Z1" />
+        </div>
+        <div>
+          <label class="muted">New Zone Name</label>
+          <input id="zoneName" type="text" value="Area 1" />
+        </div>
       </div>
-    </div>
 
-    <div class="row">
-      <div style="flex:1">
-        <label class="muted">Enter Zone</label>
-        <select id="phZone"></select>
+      <div class="row">
+        <button id="btnClearRect" class="danger" disabled>Cancel Rectangle</button>
+        <span class="muted">Clicks: <span id="rectClicks">0</span>/2</span>
       </div>
-      <div style="flex:1">
-        <label class="muted">Distance CP</label>
-        <select id="phCP"></select>
+
+      <label class="muted">Zones</label>
+      <div id="zonesList" class="list"></div>
+
+      <div class="sep"></div>
+
+      <div class="two">
+        <div>
+          <label class="muted">New CP ID (2 chars shown)</label>
+          <input id="cpId" type="text" value="A" />
+        </div>
+        <div>
+          <label class="muted">New CP Name</label>
+          <input id="cpName" type="text" value="Start" />
+        </div>
       </div>
+
+      <label class="muted">Checkpoints</label>
+      <div id="cpsList" class="list"></div>
+
+      <div class="sep"></div>
+
+      <h3>Phases (Ordered)</h3>
+      <div class="hint">
+        Strict order: phase can start only by entering its zone. You can only advance to the NEXT phase
+        by entering the NEXT phase zone, and only if current phase has started.
+      </div>
+
+      <div class="two">
+        <div>
+          <label class="muted">Phase ID</label>
+          <input id="phId" type="text" value="p1" />
+        </div>
+        <div>
+          <label class="muted">Phase Name</label>
+          <input id="phName" type="text" value="Stage 1" />
+        </div>
+      </div>
+
+      <div class="row">
+        <div style="flex:1">
+          <label class="muted">Enter Zone</label>
+          <select id="phZone"></select>
+        </div>
+        <div style="flex:1">
+          <label class="muted">Distance CP</label>
+          <select id="phCP"></select>
+        </div>
+      </div>
+
+      <div class="row">
+        <button id="btnUpsertPhase">Add/Update Phase</button>
+        <button id="btnDelPhase" class="danger">Delete Phase</button>
+      </div>
+
+      <label class="muted">Phase List</label>
+      <div id="phList" class="list"></div>
+
+      <div class="sep"></div>
     </div>
-
-    <div class="row">
-      <button id="btnUpsertPhase">Add/Update Phase</button>
-      <button id="btnDelPhase" class="danger">Delete Phase</button>
-    </div>
-
-    <label class="muted">Phase List</label>
-    <div id="phList" class="list"></div>
-
-    <div class="sep"></div>
 
     <h3>Scoreboard</h3>
     <div class="row muted">
@@ -414,7 +543,7 @@ const INDEX_HTML = `<!doctype html>
 
     <div class="sep"></div>
     <div class="muted">
-      Endpoints: <span class="mono">/course</span>, <span class="mono">/scoreboard</span>, <span class="mono">/hidden_devices</span>
+      Endpoints: <span class="mono">/course?name=</span>, <span class="mono">/courses</span>, <span class="mono">/active_course</span>, <span class="mono">/scoreboard</span>
     </div>
   </div>
 
@@ -427,16 +556,23 @@ const INDEX_HTML = `<!doctype html>
       attribution: "&copy; OpenStreetMap contributors",
     }).addTo(map);
 
-    let course = { version:1, zones:[], checkpoints:[], phases:[], activeWithinSec:60 };
+    let course = { version:1, name:"default", zones:[], checkpoints:[], phases:[], activeWithinSec:60 };
 
     const zoneLayers = new Map(); // zoneId -> L.rectangle
     const cpLayers = new Map();   // cpId -> L.marker
     const racerMarkers = new Map(); // device_id -> L.marker
-
     let hiddenSet = new Set();
 
     const el = (id) => document.getElementById(id);
     const setStatus = (s) => el("status").textContent = s;
+
+    // collapse/expand course tool
+    let courseVisible = true;
+    el("btnToggleCourse").onclick = () => {
+      courseVisible = !courseVisible;
+      el("courseBody").style.display = courseVisible ? "" : "none";
+      el("btnToggleCourse").textContent = courseVisible ? "Hide" : "Show";
+    };
 
     function nextZoneId() {
       const ids = new Set(course.zones.map(z => z.id));
@@ -476,15 +612,28 @@ const INDEX_HTML = `<!doctype html>
       }
     }
 
+    function makeCpIcon(text) {
+      const t = (text || "").toString().slice(0, 2);
+      return L.divIcon({
+        className: "",
+        html: "<div class='cp-badge'>" + t + "</div>",
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      });
+    }
+
     function upsertCheckpointLayer(cp) {
       let m = cpLayers.get(cp.id);
+      const label = (cp.id || "").slice(0, 2);
+
       if (!m) {
-        m = L.marker([cp.lat, cp.lon]).addTo(map);
+        m = L.marker([cp.lat, cp.lon], { icon: makeCpIcon(label) }).addTo(map);
         cpLayers.set(cp.id, m);
       } else {
         m.setLatLng([cp.lat, cp.lon]);
+        m.setIcon(makeCpIcon(label));
       }
-      m.bindTooltip(cp.id, {permanent:true, direction:"top", offset:[0,-12]});
+
       m.bindPopup("<b>" + cp.id + "</b><br>" + (cp.name||"") + "<br>" + cp.lat.toFixed(6) + "," + cp.lon.toFixed(6));
     }
 
@@ -783,20 +932,64 @@ const INDEX_HTML = `<!doctype html>
       setStatus("phase deleted (local)");
     };
 
+    // layouts
+    async function refreshLayouts() {
+      try {
+        const r = await fetch(API + "/courses");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const d = await r.json();
+        const names = Array.isArray(d.names) ? d.names : ["default"];
+
+        const sel = el("layoutSelect");
+        sel.innerHTML = "";
+        names.forEach((n) => {
+          const opt = document.createElement("option");
+          opt.value = n;
+          opt.textContent = n;
+          sel.appendChild(opt);
+        });
+
+        const cur = (el("layoutName").value || "default").trim() || "default";
+        sel.value = names.includes(cur) ? cur : (names.includes("default") ? "default" : names[0]);
+      } catch {}
+    }
+
+    el("btnRefreshLayouts").onclick = refreshLayouts;
+
+    el("layoutSelect").onchange = () => {
+      el("layoutName").value = el("layoutSelect").value;
+    };
+
+    async function setActiveLayout(name) {
+      try {
+        await fetch(API + "/active_course", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name }),
+        });
+      } catch {}
+    }
+
     // load/save course
     el("btnLoad").onclick = async () => {
       try {
+        const name = (el("layoutName").value || "default").trim() || "default";
         setStatus("loading...");
-        const r = await fetch(API + "/course");
+        const r = await fetch(API + "/course?name=" + encodeURIComponent(name));
         if (!r.ok) throw new Error("HTTP " + r.status);
         const d = await r.json();
+
         course.version = 1;
+        course.name = d.name || name;
         course.zones = Array.isArray(d.zones) ? d.zones : [];
         course.checkpoints = Array.isArray(d.checkpoints) ? d.checkpoints : [];
         course.phases = Array.isArray(d.phases) ? d.phases : [];
         course.activeWithinSec = (typeof d.activeWithinSec === "number") ? d.activeWithinSec : 60;
+
         redrawCourse();
-        setStatus("loaded");
+        await setActiveLayout(course.name);
+        await refreshLayouts();
+        setStatus("loaded (active=" + course.name + ")");
       } catch (e) {
         setStatus("load error");
         alert("Load failed: " + e.message);
@@ -805,14 +998,20 @@ const INDEX_HTML = `<!doctype html>
 
     el("btnSave").onclick = async () => {
       try {
+        const name = (el("layoutName").value || "default").trim() || "default";
         setStatus("saving...");
-        const r = await fetch(API + "/course", {
+        const r = await fetch(API + "/course?name=" + encodeURIComponent(name), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(course),
         });
         if (!r.ok) throw new Error("HTTP " + r.status);
-        setStatus("saved");
+        const resp = await r.json().catch(() => ({}));
+        course.name = resp.name || name;
+
+        await setActiveLayout(course.name);
+        await refreshLayouts();
+        setStatus("saved (active=" + course.name + ")");
       } catch (e) {
         setStatus("save error");
         alert("Save failed: " + e.message);
@@ -939,7 +1138,6 @@ const INDEX_HTML = `<!doctype html>
         const items = Array.isArray(d.items) ? d.items : [];
         const active = d.active_count ?? 0;
 
-        // remove markers of hidden devices (if any remained)
         for (const id of hiddenSet) removeRacerMarker(id);
 
         renderScore(items, active);
@@ -954,11 +1152,54 @@ const INDEX_HTML = `<!doctype html>
     renderPhaseSelects();
     renderPhases();
     loadHidden();
+    refreshLayouts();
     tickScore();
     setInterval(tickScore, 1000);
   </script>
 </body>
 </html>`;
+
+// ---------------------- Validation ----------------------
+function validateCourseBody(body) {
+  body.version = 1;
+  body.zones = Array.isArray(body.zones) ? body.zones : [];
+  body.checkpoints = Array.isArray(body.checkpoints) ? body.checkpoints : [];
+  body.phases = Array.isArray(body.phases) ? body.phases : [];
+  if (typeof body.activeWithinSec !== "number") body.activeWithinSec = 60;
+
+  // Validate zones: rectangles only
+  for (const z of body.zones) {
+    if (!z || typeof z !== "object") return "Invalid zone object";
+    if (!z.id || typeof z.id !== "string") return "Zone id required";
+    if (!z.bounds || typeof z.bounds !== "object") return "Zone bounds required";
+    const b = z.bounds;
+    if ([b.south, b.west, b.north, b.east].some((x) => typeof x !== "number")) {
+      return "Zone bounds must be numbers (south,west,north,east)";
+    }
+  }
+
+  // Validate checkpoints
+  for (const c of body.checkpoints) {
+    if (!c || typeof c !== "object") return "Invalid checkpoint object";
+    if (!c.id || typeof c.id !== "string") return "Checkpoint id required";
+    if (typeof c.lat !== "number" || typeof c.lon !== "number") return "Checkpoint lat/lon must be numbers";
+  }
+
+  const zoneIds = new Set(body.zones.map((z) => z.id));
+  const cpIds = new Set(body.checkpoints.map((c) => c.id));
+
+  // Validate phases
+  for (const p of body.phases) {
+    if (!p || typeof p !== "object") return "Invalid phase object";
+    if (!p.id || typeof p.id !== "string") return "Phase id required";
+    if (!p.enter_zone_id || typeof p.enter_zone_id !== "string") return "Phase enter_zone_id required";
+    if (!p.distance_checkpoint_id || typeof p.distance_checkpoint_id !== "string") return "Phase distance_checkpoint_id required";
+    if (!zoneIds.has(p.enter_zone_id)) return "Phase enter_zone_id not found in zones: " + p.enter_zone_id;
+    if (!cpIds.has(p.distance_checkpoint_id)) return "Phase distance_checkpoint_id not found in checkpoints: " + p.distance_checkpoint_id;
+  }
+
+  return null;
+}
 
 // ---------------------- Worker fetch ----------------------
 export default {
@@ -984,6 +1225,28 @@ export default {
     // Health
     if (request.method === "GET" && url.pathname === "/health") {
       return json({ ok: true, server_time_ms: nowMs() });
+    }
+
+    // List layouts
+    if (request.method === "GET" && url.pathname === "/courses") {
+      const names = await listCourses(env);
+      return json({ ok: true, names });
+    }
+
+    // Active layout getter/setter
+    if (url.pathname === "/active_course") {
+      if (request.method === "GET") {
+        const name = await getActiveCourseName(env);
+        return json({ ok: true, name });
+      }
+      if (request.method === "POST") {
+        let body;
+        try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
+        const name = normalizeCourseName(body?.name || "default");
+        const out = await setActiveCourseName(env, name);
+        return json({ ok: true, name: out });
+      }
+      return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
     // Hidden devices
@@ -1012,58 +1275,26 @@ export default {
       return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
-    // Course management
+    // Course management (multi-layout)
     if (url.pathname === "/course") {
+      const name = normalizeCourseName(url.searchParams.get("name") || "default");
+
       if (request.method === "GET") {
-        const course = await getCourse(env);
+        const course = await getCourseByName(env, name);
         return json(course);
       }
+
       if (request.method === "POST") {
         let body;
         try { body = await request.json(); } catch { return json({ ok: false, error: "Invalid JSON" }, 400); }
 
-        body.version = 1;
-        body.zones = Array.isArray(body.zones) ? body.zones : [];
-        body.checkpoints = Array.isArray(body.checkpoints) ? body.checkpoints : [];
-        body.phases = Array.isArray(body.phases) ? body.phases : [];
-        if (typeof body.activeWithinSec !== "number") body.activeWithinSec = 60;
+        const err = validateCourseBody(body);
+        if (err) return json({ ok: false, error: err }, 400);
 
-        // Validate zones: rectangles only
-        for (const z of body.zones) {
-          if (!z || typeof z !== "object") return json({ ok: false, error: "Invalid zone object" }, 400);
-          if (!z.id || typeof z.id !== "string") return json({ ok: false, error: "Zone id required" }, 400);
-          if (!z.bounds || typeof z.bounds !== "object") return json({ ok: false, error: "Zone bounds required" }, 400);
-          const b = z.bounds;
-          if ([b.south, b.west, b.north, b.east].some((x) => typeof x !== "number")) {
-            return json({ ok: false, error: "Zone bounds must be numbers (south,west,north,east)" }, 400);
-          }
-        }
-
-        // Validate checkpoints
-        for (const c of body.checkpoints) {
-          if (!c || typeof c !== "object") return json({ ok: false, error: "Invalid checkpoint object" }, 400);
-          if (!c.id || typeof c.id !== "string") return json({ ok: false, error: "Checkpoint id required" }, 400);
-          if (typeof c.lat !== "number" || typeof c.lon !== "number") {
-            return json({ ok: false, error: "Checkpoint lat/lon must be numbers" }, 400);
-          }
-        }
-
-        const zoneIds = new Set(body.zones.map((z) => z.id));
-        const cpIds = new Set(body.checkpoints.map((c) => c.id));
-
-        // Validate phases
-        for (const p of body.phases) {
-          if (!p || typeof p !== "object") return json({ ok: false, error: "Invalid phase object" }, 400);
-          if (!p.id || typeof p.id !== "string") return json({ ok: false, error: "Phase id required" }, 400);
-          if (!p.enter_zone_id || typeof p.enter_zone_id !== "string") return json({ ok: false, error: "Phase enter_zone_id required" }, 400);
-          if (!p.distance_checkpoint_id || typeof p.distance_checkpoint_id !== "string") return json({ ok: false, error: "Phase distance_checkpoint_id required" }, 400);
-          if (!zoneIds.has(p.enter_zone_id)) return json({ ok: false, error: "Phase enter_zone_id not found in zones: " + p.enter_zone_id }, 400);
-          if (!cpIds.has(p.distance_checkpoint_id)) return json({ ok: false, error: "Phase distance_checkpoint_id not found in checkpoints: " + p.distance_checkpoint_id }, 400);
-        }
-
-        await saveCourse(env, body);
-        return json({ ok: true });
+        const savedName = await saveCourseByName(env, name, body);
+        return json({ ok: true, name: savedName });
       }
+
       return json({ ok: false, error: "Method not allowed" }, 405);
     }
 
@@ -1090,7 +1321,7 @@ export default {
 
       await saveLatestAndRegisterDevice(env, entry);
 
-      const course = await getCourse(env);
+      const course = await getActiveCourse(env);
       await updateRaceState(env, course, device_id, lat, lon, entry.received_at_ms);
 
       return json({ ok: true });
@@ -1116,7 +1347,7 @@ export default {
         const entry = { device_id, t_ms, lat, lon, received_at_ms: nowMs() };
         await saveLatestAndRegisterDevice(env, entry);
 
-        const course = await getCourse(env);
+        const course = await getActiveCourse(env);
         await updateRaceState(env, course, device_id, lat, lon, entry.received_at_ms);
 
         return text("OK");
@@ -1148,7 +1379,7 @@ export default {
         const entry = { device_id, t_ms, lat, lon, received_at_ms: nowMs() };
         await saveLatestAndRegisterDevice(env, entry);
 
-        const course = await getCourse(env);
+        const course = await getActiveCourse(env);
         await updateRaceState(env, course, device_id, lat, lon, entry.received_at_ms);
 
         return text("OK");
@@ -1157,7 +1388,7 @@ export default {
       return text("Method not allowed", 405);
     }
 
-    // latest_all (optionally filtered by hidden)
+    // latest_all (filtered by hidden)
     if (request.method === "GET" && url.pathname === "/latest_all") {
       const hidden = new Set(await getHiddenDevices(env));
 
@@ -1185,9 +1416,9 @@ export default {
       catch { return json({ ok: false, error: "Corrupt data" }, 500); }
     }
 
-    // Scoreboard
+    // Scoreboard (uses ACTIVE layout)
     if (request.method === "GET" && url.pathname === "/scoreboard") {
-      const course = await getCourse(env);
+      const course = await getActiveCourse(env);
       const serverTimeMs = nowMs();
 
       const hidden = await getHiddenDevices(env);
@@ -1235,6 +1466,7 @@ export default {
 
       return json({
         server_time_ms: serverTimeMs,
+        active_course: course.name || (await getActiveCourseName(env)),
         active_count: activeCount,
         items: out,
       });
